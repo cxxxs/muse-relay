@@ -40,7 +40,10 @@ def main() -> int:
             if m.get("mine"):
                 continue
             if m.get("sig_ok") and m.get("decrypt_ok"):
-                print(f"[{space_id}] {m['author']} says: {m['body']}")
+                # Roster-bound display name (fetch already resolved it);
+                # fall back to the plaintext author only if resolution
+                # produced nothing at all.
+                print(f"[{space_id}] {m.get('author_display') or m['author']} says: {m['body']}")
             else:
                 print(
                     f"[!] unverifiable message arrived in space {space_id} "

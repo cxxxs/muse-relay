@@ -1931,9 +1931,158 @@ function eddsa(Point, cHash, eddsaOpts = {}) {
   });
 }
 
-// node_modules/@noble/curves/ed25519.js
+// node_modules/@noble/curves/abstract/montgomery.js
+var _0n5 = /* @__PURE__ */ BigInt(0);
 var _1n5 = /* @__PURE__ */ BigInt(1);
 var _2n3 = /* @__PURE__ */ BigInt(2);
+function cmask(P, swap) {
+  return P + swap - (swap >> _1n5 << _1n5);
+}
+function cswap(P) {
+  const offset = BigInt(6) * P;
+  return (mask, x_2, x_3) => {
+    const sum = x_2 + x_3;
+    const d = offset + x_3 - x_2;
+    const a = (d * mask + x_2) % P;
+    return { x_2: a, x_3: sum - a };
+  };
+}
+function validateOpts(curve) {
+  validateObject(curve, {
+    P: "bigint",
+    type: "string",
+    adjustScalarBytes: "function",
+    powPminus2: "function"
+  }, {
+    randomBytes: "function",
+    scalarMultBase: "function"
+  });
+  return Object.freeze({ ...curve });
+}
+function montgomery(curveDef) {
+  const CURVE = validateOpts(curveDef);
+  const { P, type, adjustScalarBytes: adjustScalarBytes2, powPminus2, randomBytes: rand } = CURVE;
+  const mulBaseHook = CURVE.scalarMultBase;
+  const is25519 = type === "x25519";
+  if (!is25519 && type !== "x448")
+    throw new Error("invalid type");
+  const randomBytes_ = rand === void 0 ? randomBytes2 : rand;
+  const montgomeryBits = is25519 ? 255 : 448;
+  const swap = cswap(P);
+  const fieldLen = is25519 ? 32 : 56;
+  const Gu = is25519 ? BigInt(9) : BigInt(5);
+  const a24 = is25519 ? BigInt(121665) : BigInt(39081);
+  const minScalar = is25519 ? _2n3 ** BigInt(254) : _2n3 ** BigInt(447);
+  const maxAdded = is25519 ? BigInt(8) * (_2n3 ** BigInt(251) - _1n5) : BigInt(4) * (_2n3 ** BigInt(445) - _1n5);
+  const maxScalar = minScalar + maxAdded + _1n5;
+  const modP = (n) => mod(n, P);
+  const GuBytes = encodeU(Gu);
+  function encodeU(u) {
+    return numberToBytesLE(modP(u), fieldLen);
+  }
+  function decodeU(u) {
+    const _u = copyBytes(abytes2(u, fieldLen, "uCoordinate"));
+    if (is25519)
+      _u[31] &= 127;
+    return modP(bytesToNumberLE(_u));
+  }
+  function decodeScalar(scalar) {
+    return bytesToNumberLE(adjustScalarBytes2(copyBytes(abytes2(scalar, fieldLen, "scalar"))));
+  }
+  const lowOrderU = new Set(is25519 ? [
+    _0n5,
+    _1n5,
+    P - _1n5,
+    BigInt("325606250916557431795983626356110631294008115727848805560023387167927233504"),
+    BigInt("39382357235489614581723060781553021112529911719440698176882885853963445705823")
+  ] : [_0n5, _1n5, P - _1n5]);
+  function scalarMult(scalar, u) {
+    const pointU = decodeU(u);
+    if (lowOrderU.has(pointU))
+      throw new Error("invalid private or public key received");
+    const pu = montgomeryLadder(pointU, decodeScalar(scalar));
+    if (pu === _0n5)
+      throw new Error("invalid private or public key received");
+    return encodeU(pu);
+  }
+  function scalarMultBase(scalar) {
+    if (mulBaseHook === void 0)
+      return scalarMult(scalar, GuBytes);
+    const k = decodeScalar(scalar);
+    aInRange("scalar", k, minScalar, maxScalar);
+    const pu = modP(mulBaseHook(k));
+    if (pu === _0n5)
+      throw new Error("invalid private or public key received");
+    return encodeU(pu);
+  }
+  const getPublicKey = scalarMultBase;
+  const getSharedSecret = scalarMult;
+  function montgomeryLadder(u, scalar) {
+    aInRange("u", u, _0n5, P);
+    aInRange("scalar", scalar, minScalar, maxScalar);
+    const k = scalar;
+    const x_1 = u;
+    let x_2 = _1n5;
+    let z_2 = _0n5;
+    let x_3 = u;
+    let z_3 = _1n5;
+    const kx = k ^ k >> _1n5;
+    for (let t = BigInt(montgomeryBits - 1); t >= _0n5; t--) {
+      const mask2 = cmask(P, kx >> t);
+      ({ x_2, x_3 } = swap(mask2, x_2, x_3));
+      ({ x_2: z_2, x_3: z_3 } = swap(mask2, z_2, z_3));
+      const A = x_2 + z_2;
+      const AA = modP(A * A);
+      const B = x_2 - z_2;
+      const BB = modP(B * B);
+      const E = AA - BB;
+      const C = x_3 + z_3;
+      const D = x_3 - z_3;
+      const DA = modP(D * A);
+      const CB = modP(C * B);
+      const dacb = DA + CB;
+      const da_cb = DA - CB;
+      x_3 = modP(dacb * dacb);
+      z_3 = modP(x_1 * modP(da_cb * da_cb));
+      x_2 = modP(AA * BB);
+      z_2 = modP(E * (AA + modP(a24 * E)));
+    }
+    const mask = cmask(P, k);
+    ({ x_2, x_3 } = swap(mask, x_2, x_3));
+    ({ x_2: z_2, x_3: z_3 } = swap(mask, z_2, z_3));
+    const z2 = powPminus2(z_2);
+    return modP(x_2 * z2);
+  }
+  const lengths = {
+    secretKey: fieldLen,
+    publicKey: fieldLen,
+    seed: fieldLen
+  };
+  const randomSecretKey = (seed) => {
+    seed = seed === void 0 ? randomBytes_(fieldLen) : seed;
+    abytes2(seed, lengths.seed, "seed");
+    return seed;
+  };
+  const utils = { randomSecretKey };
+  Object.freeze(lengths);
+  Object.freeze(utils);
+  return Object.freeze({
+    keygen: createKeygen(randomSecretKey, getPublicKey),
+    getSharedSecret,
+    getPublicKey,
+    scalarMult,
+    scalarMultBase,
+    utils,
+    GuBytes: GuBytes.slice(),
+    lengths
+  });
+}
+
+// node_modules/@noble/curves/ed25519.js
+var _0n6 = /* @__PURE__ */ BigInt(0);
+var _1n6 = /* @__PURE__ */ BigInt(1);
+var _2n4 = /* @__PURE__ */ BigInt(2);
+var _3n2 = /* @__PURE__ */ BigInt(3);
 var _5n2 = /* @__PURE__ */ BigInt(5);
 var _8n3 = /* @__PURE__ */ BigInt(8);
 var ed25519_CURVE_p = /* @__PURE__ */ BigInt("0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed");
@@ -1951,8 +2100,8 @@ function ed25519_pow_2_252_3(x) {
   const P = ed25519_CURVE_p;
   const x2 = x * x % P;
   const b2 = x2 * x % P;
-  const b4 = pow2(b2, _2n3, P) * b2 % P;
-  const b5 = pow2(b4, _1n5, P) * x % P;
+  const b4 = pow2(b2, _2n4, P) * b2 % P;
+  const b5 = pow2(b4, _1n6, P) * x % P;
   const b10 = pow2(b5, _5n2, P) * b5 % P;
   const b20 = pow2(b10, _10n, P) * b10 % P;
   const b40 = pow2(b20, _20n, P) * b20 % P;
@@ -1960,7 +2109,7 @@ function ed25519_pow_2_252_3(x) {
   const b160 = pow2(b80, _80n, P) * b80 % P;
   const b240 = pow2(b160, _80n, P) * b80 % P;
   const b250 = pow2(b240, _10n, P) * b10 % P;
-  const pow_p_5_8 = pow2(b250, _2n3, P) * x % P;
+  const pow_p_5_8 = pow2(b250, _2n4, P) * x % P;
   return { pow_p_5_8, b2 };
 }
 function adjustScalarBytes(bytes) {
@@ -1994,7 +2143,7 @@ var ed25519_Point = /* @__PURE__ */ edwards(ed25519_CURVE, { uvRatio });
 var Fp = /* @__PURE__ */ (() => ed25519_Point.Fp)();
 function toMontgomery(point) {
   const { y } = point;
-  return Fp.toBytes(Fp.div(_1n5 + y, _1n5 - y));
+  return Fp.toBytes(Fp.div(_1n6 + y, _1n6 - y));
 }
 function toMontgomerySecret(secretKey) {
   const size = ed25519_Point.Fp.BYTES;
@@ -2005,6 +2154,29 @@ function ed(opts) {
   return eddsa(ed25519_Point, sha512, Object.assign({ adjustScalarBytes, toMontgomery, toMontgomerySecret, zip215: true }, opts));
 }
 var ed25519 = /* @__PURE__ */ ed({});
+var x25519 = /* @__PURE__ */ (() => {
+  const P = ed25519_CURVE_p;
+  const powPminus2 = (x) => {
+    const { pow_p_5_8, b2 } = ed25519_pow_2_252_3(x);
+    return mod(pow2(pow_p_5_8, _3n2, P) * b2, P);
+  };
+  return montgomery({
+    P,
+    type: "x25519",
+    powPminus2,
+    adjustScalarBytes,
+    // ~3x faster fixed-base: [k]B on the birationally-equivalent Edwards curve using cached
+    // base tables, mapped back via u = (1+y)/(1-y) = (Z+Y)/(Z-Y) with one Fermat inversion.
+    // Same construction as libsodium's crypto_scalarmult_curve25519_base.
+    scalarMultBase: (k) => {
+      const kn = mod(k, ed25519_Point.Fn.ORDER);
+      if (kn === _0n6)
+        return _0n6;
+      const p = ed25519_Point.BASE.multiply(kn);
+      return mod((p.Z + p.Y) * powPminus2(mod(p.Z - p.Y, P)), P);
+    }
+  });
+})();
 
 // client/words.js
 var WORDS = [
@@ -4284,6 +4456,160 @@ function verifyMessage(pubB64, spaceIdB64, nonceB64, ciphertextB64, sigB64) {
     return false;
   }
 }
+function epochBytes(epoch) {
+  const buf = new ArrayBuffer(8);
+  new DataView(buf).setBigUint64(0, BigInt(epoch));
+  return new Uint8Array(buf);
+}
+function sig2Input(spaceIdB64, epoch, nonceB64, ciphertextB64) {
+  const parts = [
+    te.encode("muse-relay-msg-v2"),
+    b64urlDecode(spaceIdB64),
+    epochBytes(epoch),
+    b64urlDecode(nonceB64),
+    b64urlDecode(ciphertextB64)
+  ];
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const p of parts) {
+    out.set(p, o);
+    o += p.length;
+  }
+  return out;
+}
+function kickInput(spaceIdB64, pubB64, epoch) {
+  const parts = [
+    te.encode("muse-relay-kick-v1"),
+    b64urlDecode(spaceIdB64),
+    b64urlDecode(pubB64),
+    epochBytes(epoch)
+  ];
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const p of parts) {
+    out.set(p, o);
+    o += p.length;
+  }
+  return out;
+}
+function epochInput(spaceIdB64, epoch) {
+  const parts = [
+    te.encode("muse-relay-epoch-v1"),
+    b64urlDecode(spaceIdB64),
+    epochBytes(epoch)
+  ];
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const p of parts) {
+    out.set(p, o);
+    o += p.length;
+  }
+  return out;
+}
+function signMessageV2(privB64, spaceIdB64, epoch, nonceB64, ciphertextB64) {
+  const sig = ed25519.sign(
+    sig2Input(spaceIdB64, epoch, nonceB64, ciphertextB64),
+    b64urlDecode(privB64)
+  );
+  return b64urlEncode(sig);
+}
+function verifyMessageV2(pubB64, spaceIdB64, epoch, nonceB64, ciphertextB64, sigB64) {
+  try {
+    return ed25519.verify(
+      b64urlDecode(sigB64),
+      sig2Input(spaceIdB64, epoch, nonceB64, ciphertextB64),
+      b64urlDecode(pubB64)
+    );
+  } catch {
+    return false;
+  }
+}
+function signKick(seedB64, spaceIdB64, pubB64, epoch) {
+  const sig = ed25519.sign(kickInput(spaceIdB64, pubB64, epoch), b64urlDecode(seedB64));
+  return b64urlEncode(sig);
+}
+function verifyKick(controlPubB64, spaceIdB64, pubB64, epoch, sigB64) {
+  try {
+    return ed25519.verify(
+      b64urlDecode(sigB64),
+      kickInput(spaceIdB64, pubB64, epoch),
+      b64urlDecode(controlPubB64)
+    );
+  } catch {
+    return false;
+  }
+}
+function signEpochBundle(seedB64, spaceIdB64, epoch) {
+  const sig = ed25519.sign(epochInput(spaceIdB64, epoch), b64urlDecode(seedB64));
+  return b64urlEncode(sig);
+}
+function verifyEpochBundle(controlPubB64, spaceIdB64, epoch, sigB64) {
+  try {
+    return ed25519.verify(
+      b64urlDecode(sigB64),
+      epochInput(spaceIdB64, epoch),
+      b64urlDecode(controlPubB64)
+    );
+  } catch {
+    return false;
+  }
+}
+function genXKeypair() {
+  const priv = x25519.utils.randomSecretKey();
+  const pub = x25519.getPublicKey(priv);
+  return { privB64: b64urlEncode(priv), pubB64: b64urlEncode(pub) };
+}
+function x25519Shared(privB64, pubB64) {
+  return x25519.getSharedSecret(b64urlDecode(privB64), b64urlDecode(pubB64));
+}
+async function epochWrappingKey(shared, spaceIdB64, epoch) {
+  const ikm = await crypto.subtle.importKey("raw", shared, "HKDF", false, ["deriveBits"]);
+  const infoParts = [b64urlDecode(spaceIdB64), epochBytes(epoch)];
+  const infoLen = infoParts.reduce((n, p) => n + p.length, 0);
+  const info = new Uint8Array(infoLen);
+  let o = 0;
+  for (const p of infoParts) {
+    info.set(p, o);
+    o += p.length;
+  }
+  const bits = await crypto.subtle.deriveBits(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: te.encode("muse-relay-epoch-v1"),
+      info
+    },
+    ikm,
+    256
+  );
+  return new Uint8Array(bits);
+}
+async function wrapEpochKey(wrappingKey, epochKey) {
+  const nonce = randomBytes3(12);
+  const ct = new Uint8Array(
+    await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv: nonce },
+      await importAesGcm(wrappingKey, ["encrypt"]),
+      epochKey
+    )
+  );
+  const blob = new Uint8Array(12 + ct.length);
+  blob.set(nonce, 0);
+  blob.set(ct, 12);
+  return b64urlEncode(blob);
+}
+async function unwrapEpochKey(wrappingKey, wrappedB64) {
+  const blob = b64urlDecode(wrappedB64);
+  const pt = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: blob.slice(0, 12) },
+    await importAesGcm(wrappingKey, ["decrypt"]),
+    blob.slice(12)
+  );
+  return new Uint8Array(pt);
+}
 function parseRelayLink(url) {
   const u = new URL(url);
   const m = u.pathname.match(/^\/s\/([A-Za-z0-9_-]{22})$/);
@@ -4314,6 +4640,7 @@ async function createSpace(base, displayName) {
   const control = genControlKeypair();
   const wrappedControl = await wrapControlSeed(spaceKey, control.seedB64);
   const member = genMemberKeypair();
+  const xkey = genXKeypair();
   const cert = signMemberCert(control.seedB64, spaceId, member.pubB64, displayName);
   await req(base, "/api/spaces", {
     method: "POST",
@@ -4325,26 +4652,28 @@ async function createSpace(base, displayName) {
       control_pub: control.pubB64,
       display_name: displayName,
       pubkey: member.pubB64,
-      cert
+      cert,
+      x_pubkey: xkey.pubB64
     })
   });
   return {
     spaceId,
     keyB64: b64urlEncode(spaceKey),
     code: codeWords.join(" "),
-    member,
+    member: { ...member, xPubB64: xkey.pubB64, xPrivB64: xkey.privB64 },
     controlPubB64: control.pubB64,
     link: `${base}/s/${spaceId}#k=${b64urlEncode(spaceKey)}`
   };
 }
 async function registerMember(base, spaceId, controlSeedB64, displayName) {
   const member = genMemberKeypair();
+  const xkey = genXKeypair();
   const cert = signMemberCert(controlSeedB64, spaceId, member.pubB64, displayName);
   const mres = await req(base, `/api/spaces/${spaceId}/members`, {
     method: "POST",
-    body: JSON.stringify({ display_name: displayName, pubkey: member.pubB64, cert })
+    body: JSON.stringify({ display_name: displayName, pubkey: member.pubB64, cert, x_pubkey: xkey.pubB64 })
   });
-  return { member, members: mres.members };
+  return { member: { ...member, xPubB64: xkey.pubB64, xPrivB64: xkey.privB64 }, members: mres.members };
 }
 async function codeLookup(base, codeWords) {
   const words = codeWords.trim().toLowerCase().split(/\s+/);
@@ -4456,6 +4785,13 @@ async function sendMessage(base, spaceId, keyB64, member, author, body) {
     })
   });
 }
+function resolveAuthor(pubkey, names, plaintextAuthor) {
+  const entry = names ? names.get(pubkey) : null;
+  if (entry && entry.certOk) return { display: entry.name, verified: true };
+  if (plaintextAuthor)
+    return { display: `[unverified name] ${plaintextAuthor}`, verified: false };
+  return { display: "[unverified name]", verified: false };
+}
 async function fetchMessages(base, spaceId, keyB64, since = "", limit = 50) {
   const data = await req(
     base,
@@ -4463,14 +4799,19 @@ async function fetchMessages(base, spaceId, keyB64, since = "", limit = 50) {
   );
   const out = [];
   for (const m of data.messages) {
-    const sigOk = verifyMessage(m.pubkey, spaceId, m.nonce, m.ciphertext, m.signature);
+    const version = m.version === 2 ? 2 : 1;
+    const sigOk = version === 2 ? verifyMessageV2(m.pubkey, spaceId, m.epoch, m.nonce, m.ciphertext, m.signature) : verifyMessage(m.pubkey, spaceId, m.nonce, m.ciphertext, m.signature);
     let plaintext = null, decryptOk = true;
-    try {
-      plaintext = await decryptMessage(b64urlDecode(keyB64), m.nonce, m.ciphertext);
-    } catch {
+    if (version === 2) {
       decryptOk = false;
+    } else {
+      try {
+        plaintext = await decryptMessage(b64urlDecode(keyB64), m.nonce, m.ciphertext);
+      } catch {
+        decryptOk = false;
+      }
     }
-    out.push({ ...m, sigOk, decryptOk, plaintext });
+    out.push({ ...m, version, sigOk, decryptOk, plaintext });
   }
   return out;
 }
@@ -4519,27 +4860,40 @@ export {
   deriveKek,
   deriveLookup,
   encryptMessage,
+  epochBytes,
+  epochWrappingKey,
   fetchMessages,
   genCodeWords,
   genControlKeypair,
   genMemberKeypair,
+  genXKeypair,
   joinWithCode,
   joinWithKey,
   joinWithLink,
   parseRelayLink,
   randomBytes3 as randomBytes,
   registerWithSeed,
+  resolveAuthor,
   sendMessage,
   sha256,
+  signEpochBundle,
+  signKick,
   signMemberCert,
   signMessage,
+  signMessageV2,
   unwrapControlSeed,
+  unwrapEpochKey,
   unwrapSpaceKey,
+  verifyEpochBundle,
+  verifyKick,
   verifyMemberCert,
   verifyMessage,
+  verifyMessageV2,
   verifyRoster,
   wrapControlSeed,
-  wrapSpaceKey
+  wrapEpochKey,
+  wrapSpaceKey,
+  x25519Shared
 };
 /*! Bundled license information:
 
@@ -4547,6 +4901,7 @@ export {
 @noble/curves/abstract/modular.js:
 @noble/curves/abstract/curve.js:
 @noble/curves/abstract/edwards.js:
+@noble/curves/abstract/montgomery.js:
 @noble/curves/ed25519.js:
   (*! noble-curves - MIT License (c) 2022 Paul Miller (paulmillr.com) *)
 */

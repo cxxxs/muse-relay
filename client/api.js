@@ -7,6 +7,7 @@ import {
   wrapSpaceKey, unwrapSpaceKey,
   encryptMessage, decryptMessage,
   genMemberKeypair, signMessage, verifyMessage,
+  genXKeypair, signMessageV2, verifyMessageV2,
   genControlKeypair, wrapControlSeed, unwrapControlSeed, controlPubFromSeed,
   signMemberCert, verifyMemberCert,
   parseRelayLink,
@@ -38,6 +39,9 @@ export async function createSpace(base, displayName) {
   const control = genControlKeypair();
   const wrappedControl = await wrapControlSeed(spaceKey, control.seedB64);
   const member = genMemberKeypair();
+  // Rotation capability from birth: the creator's X25519 key doubles as
+  // the admin wrapping key (see relay.py create).
+  const xkey = genXKeypair();
   const cert = signMemberCert(control.seedB64, spaceId, member.pubB64, displayName);
   await req(base, "/api/spaces", {
     method: "POST",
@@ -50,13 +54,14 @@ export async function createSpace(base, displayName) {
       display_name: displayName,
       pubkey: member.pubB64,
       cert,
+      x_pubkey: xkey.pubB64,
     }),
   });
   return {
     spaceId,
     keyB64: b64urlEncode(spaceKey),
     code: codeWords.join(" "),
-    member,
+    member: { ...member, xPubB64: xkey.pubB64, xPrivB64: xkey.privB64 },
     controlPubB64: control.pubB64,
     link: `${base}/s/${spaceId}#k=${b64urlEncode(spaceKey)}`,
   };
@@ -66,12 +71,13 @@ export async function createSpace(base, displayName) {
  *  space-key holders can unwrap. */
 async function registerMember(base, spaceId, controlSeedB64, displayName) {
   const member = genMemberKeypair();
+  const xkey = genXKeypair();
   const cert = signMemberCert(controlSeedB64, spaceId, member.pubB64, displayName);
   const mres = await req(base, `/api/spaces/${spaceId}/members`, {
     method: "POST",
-    body: JSON.stringify({ display_name: displayName, pubkey: member.pubB64, cert }),
+    body: JSON.stringify({ display_name: displayName, pubkey: member.pubB64, cert, x_pubkey: xkey.pubB64 }),
   });
-  return { member, members: mres.members };
+  return { member: { ...member, xPubB64: xkey.pubB64, xPrivB64: xkey.privB64 }, members: mres.members };
 }
 
 /** Look up a space from the 8-word pairing code WITHOUT registering.
@@ -183,21 +189,45 @@ export async function sendMessage(base, spaceId, keyB64, member, author, body) {
   });
 }
 
+/** Roster-bound display name. names is a Map of pubkey -> {name, certOk}.
+ * Mirrors relay.py resolve_author: the plaintext author field inside the
+ * envelope is SELF-ASSERTED and is never displayed when a verified roster
+ * entry exists for the signing key; it is only a clearly-marked fallback. */
+export function resolveAuthor(pubkey, names, plaintextAuthor) {
+  const entry = names ? names.get(pubkey) : null;
+  if (entry && entry.certOk) return { display: entry.name, verified: true };
+  if (plaintextAuthor)
+    return { display: `[unverified name] ${plaintextAuthor}`, verified: false };
+  return { display: "[unverified name]", verified: false };
+}
+
 /** Fetch + decrypt + verify. Messages that fail verification or decryption
- *  are returned with flags rather than dropped, so problems stay visible. */
+ *  are returned with flags rather than dropped, so problems stay visible.
+ *  Version-aware: v2 messages are verified under the v2 domain, and this
+ *  client — which holds only the long-lived space key — cannot decrypt
+ *  them. That is reported distinctly in the UI, never rendered as if it
+ *  were plaintext. */
 export async function fetchMessages(base, spaceId, keyB64, since = "", limit = 50) {
   const data = await req(base,
     `/api/spaces/${spaceId}/messages?since=${encodeURIComponent(since)}&limit=${limit}`);
   const out = [];
   for (const m of data.messages) {
-    const sigOk = verifyMessage(m.pubkey, spaceId, m.nonce, m.ciphertext, m.signature);
+    const version = m.version === 2 ? 2 : 1;
+    const sigOk = version === 2
+      ? verifyMessageV2(m.pubkey, spaceId, m.epoch, m.nonce, m.ciphertext, m.signature)
+      : verifyMessage(m.pubkey, spaceId, m.nonce, m.ciphertext, m.signature);
     let plaintext = null, decryptOk = true;
-    try {
-      plaintext = await decryptMessage(b64urlDecode(keyB64), m.nonce, m.ciphertext);
-    } catch {
+    if (version === 2) {
+      // Epoch-key ciphertext: undecryptable with the space key alone.
       decryptOk = false;
+    } else {
+      try {
+        plaintext = await decryptMessage(b64urlDecode(keyB64), m.nonce, m.ciphertext);
+      } catch {
+        decryptOk = false;
+      }
     }
-    out.push({ ...m, sigOk, decryptOk, plaintext });
+    out.push({ ...m, version, sigOk, decryptOk, plaintext });
   }
   return out;
 }

@@ -256,7 +256,7 @@ def test_members_uses_pinned_control_key():
              "cert": rogue_cert},
         ]},
     })
-    members = r.members(fx["space_id"])
+    members = r.members(fx["space_id"])["members"]
     by_name = {m["display_name"]: m["cert_ok"] for m in members}
     check("members() verifies against pinned key (not server's)",
           by_name.get("Legit") is True and by_name.get("Mallory") is False,

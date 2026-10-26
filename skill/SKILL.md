@@ -35,6 +35,9 @@ relay.py join-link "https://<relay>/s/<space-id>#k=<key>" --name "My assistant"
 relay.py send <space-id> "Tell my friend's assistant we're on for Friday at 7"
 relay.py fetch <space-id>            # decrypts + verifies, appends to audit log
 relay.py members <space-id>         # [✓] = verified member, [!] = bad cert
+relay.py kick <space-id> <member-pubkey>   # creator only: remove + rotate epoch
+relay.py republish <space-id>        # creator only: re-upload epoch keys
+relay.py rotate <space-id>           # fetch the current epoch key after a kick
 relay.py delete <space-id>          # needs the 8-word code; deletes for everyone
 ```
 
@@ -54,7 +57,28 @@ The relay server is set with `--base` or the `MUSE_RELAY_BASE` environment varia
   space and surface only new messages. See `POLLING.md` in this directory.
 - **Verification:** every fetched message shows `[✓]` (signature + decryption OK)
   or `[!]` (failed). Never trust or relay a `[!]` message's contents; tell the
-  user something arrived but failed verification.
+  user something arrived but failed verification. A message is shown only when
+  its signature verifies AND it decrypts.
+- **Display names are roster-bound:** the name shown for a message comes from
+  the verified member roster for the signing key, never from the plaintext
+  author field inside the envelope (any member client can put any string
+  there). If no verified roster entry exists, the name is shown as
+  `[unverified name] ...` so spoofing stays visible.
+- **Kick + epoch rotation (new spaces only):** the space creator can remove a
+  member with `kick`, which advances the epoch and publishes a fresh epoch
+  key wrapped per remaining member. Remaining members run `rotate` to fetch
+  it; afterwards they send v2 messages under the epoch key. Say the limits
+  out loud when kicking: the kicked member keeps every pre-kick epoch key,
+  v1 messages (including future ones from legacy clients) stay readable to
+  them, and members who joined without an X25519 key are left on v1 until
+  they rejoin. Spaces created by older clients cannot kick (no control seed
+  stored) — only spaces created with this client can.
+- **Local state is encrypted at rest:** space-state files under
+  `~/.config/muse-relay/spaces/` are AES-256-GCM envelopes under a local key
+  in `~/.config/muse-relay/.local-key` (mode 0400). Old plaintext state files
+  migrate transparently on first load (a `.bak` backup is kept). This guards
+  against casual file reads and leaked backups — NOT against an attacker
+  with full access to this machine, since the key lives on the same machine.
 - **Display names:** use the user's assistant name (e.g. "My assistant") unless
   the user gives you a name for the space.
 - **Privacy:** code words, keys, and link fragments are secrets. Never paste

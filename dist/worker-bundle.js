@@ -2011,9 +2011,13 @@ var ASSETS = __ASSETS_JSON__;
 var SPACE_TTL = 90 * 86400;
 var MSG_TTL = 30 * 86400;
 var SIG_DOMAIN = "muse-relay-msg-v1";
+var SIG2_DOMAIN = "muse-relay-msg-v2";
+var KICK_DOMAIN = "muse-relay-kick-v1";
+var EPOCH_DOMAIN = "muse-relay-epoch-v1";
 var CERT_DOMAIN = "muse-relay-member-v1";
 var MAX_MEMBERS = 50;
 var MAX_CIPHERTEXT_B64 = 44e3;
+var MAX_WRAPPED_B64 = 300;
 var RE_B64URL = /^[A-Za-z0-9_-]+$/;
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -2050,6 +2054,49 @@ function sigInput(spaceIdB64, nonceB64, ciphertextB64) {
     b64urlToBytes(ciphertextB64)
   );
 }
+function epochBytes(n) {
+  const buf = new ArrayBuffer(8);
+  new DataView(buf).setBigUint64(0, BigInt(n));
+  return new Uint8Array(buf);
+}
+function sig2Input(spaceIdB64, epoch, nonceB64, ciphertextB64) {
+  return concat(
+    new TextEncoder().encode(SIG2_DOMAIN),
+    b64urlToBytes(spaceIdB64),
+    // 16 bytes
+    epochBytes(epoch),
+    b64urlToBytes(nonceB64),
+    // 12 bytes
+    b64urlToBytes(ciphertextB64)
+  );
+}
+function kickInput(spaceIdB64, pubB64, epoch) {
+  return concat(
+    new TextEncoder().encode(KICK_DOMAIN),
+    b64urlToBytes(spaceIdB64),
+    b64urlToBytes(pubB64),
+    // 32 bytes
+    epochBytes(epoch)
+  );
+}
+function epochInput(spaceIdB64, epoch) {
+  return concat(
+    new TextEncoder().encode(EPOCH_DOMAIN),
+    b64urlToBytes(spaceIdB64),
+    epochBytes(epoch)
+  );
+}
+function verifyControlSig(controlPubB64, input, sigB64) {
+  try {
+    return ed25519.verify(
+      b64urlToBytes(sigB64),
+      input,
+      b64urlToBytes(controlPubB64)
+    );
+  } catch {
+    return false;
+  }
+}
 var RATE_TICKS = 10;
 async function rateLimited(env, ip, endpoint, maxPerMin) {
   const sample = Math.max(1, Math.round(maxPerMin / RATE_TICKS));
@@ -2078,11 +2125,20 @@ function validLookup(s) {
 function validPubkey(s) {
   return typeof s === "string" && s.length === 43 && RE_B64URL.test(s);
 }
+function validXPubkey(s) {
+  return validPubkey(s);
+}
 function validControlPub(s) {
   return typeof s === "string" && s.length === 43 && RE_B64URL.test(s);
 }
 function validCert(s) {
   return typeof s === "string" && s.length === 86 && RE_B64URL.test(s);
+}
+function validSig(s) {
+  return typeof s === "string" && s.length === 86 && RE_B64URL.test(s);
+}
+function validEpoch(e) {
+  return Number.isInteger(e) && e >= 0 && e <= Number.MAX_SAFE_INTEGER;
 }
 async function listAllKeys(env, prefix) {
   const names = [];
@@ -2149,7 +2205,8 @@ async function handleCreate(env, req, ip) {
     control_pub,
     display_name,
     pubkey,
-    cert
+    cert,
+    x_pubkey
   } = b;
   if (!validSpaceId(space_id)) return json({ error: "bad space_id" }, 400);
   if (!validLookup(lookup)) return json({ error: "bad lookup" }, 400);
@@ -2161,6 +2218,8 @@ async function handleCreate(env, req, ip) {
   if (!validName(display_name)) return json({ error: "bad display_name" }, 400);
   if (!validPubkey(pubkey)) return json({ error: "bad pubkey" }, 400);
   if (!validCert(cert)) return json({ error: "bad cert" }, 400);
+  if (x_pubkey !== void 0 && x_pubkey !== null && !validXPubkey(x_pubkey))
+    return json({ error: "bad x_pubkey" }, 400);
   if (!verifyMemberCert(control_pub, space_id, pubkey, display_name, cert))
     return json({ error: "bad member cert" }, 403);
   if (await getSpace(env, space_id)) return json({ error: "space exists" }, 409);
@@ -2174,10 +2233,16 @@ async function handleCreate(env, req, ip) {
     wrapped_control,
     control_pub,
     created_at: now,
+    // Epoch 0 is the v1 era: messages use the long-lived space key. The
+    // first kick moves the space to epoch 1. Old spaces loaded from KV
+    // have no epoch field; every reader treats a missing epoch as 0.
+    epoch: 0,
+    epoch_keys: null,
     members: [{
       display_name: display_name.trim(),
       pubkey,
       cert,
+      x_pubkey: x_pubkey || null,
       joined_at: now
     }]
   };
@@ -2225,12 +2290,14 @@ async function handleAddMember(env, req, ip, spaceId) {
   } catch {
     return json({ error: "invalid JSON" }, 400);
   }
-  const { display_name, pubkey, cert } = b;
+  const { display_name, pubkey, cert, x_pubkey } = b;
   if (!validName(display_name)) return json({ error: "bad display_name" }, 400);
   if (!validPubkey(pubkey)) return json({ error: "bad pubkey" }, 400);
   if (space.members.some((m) => m.pubkey === pubkey))
     return json({ ok: true, members: space.members });
   if (!validCert(cert)) return json({ error: "bad cert" }, 400);
+  if (x_pubkey !== void 0 && x_pubkey !== null && !validXPubkey(x_pubkey))
+    return json({ error: "bad x_pubkey" }, 400);
   if (!verifyMemberCert(space.control_pub, spaceId, pubkey, display_name, cert))
     return json({ error: "bad member cert" }, 403);
   if (space.members.length >= MAX_MEMBERS)
@@ -2239,6 +2306,7 @@ async function handleAddMember(env, req, ip, spaceId) {
     display_name: display_name.trim(),
     pubkey,
     cert,
+    x_pubkey: x_pubkey || null,
     joined_at: Date.now()
   });
   await putSpace(env, spaceId, space);
@@ -2273,11 +2341,19 @@ async function handlePostMessage(env, req, ip, spaceId) {
     return json({ error: "bad signature" }, 400);
   if (!space.members.some((m) => m.pubkey === pubkey))
     return json({ error: "unknown member key" }, 403);
+  const version = b.version === 2 ? 2 : 1;
+  let epoch = 0;
+  if (version === 2) {
+    if (!validEpoch(b.epoch)) return json({ error: "bad epoch" }, 400);
+    epoch = b.epoch;
+    if (epoch !== (space.epoch || 0))
+      return json({ error: "stale epoch \u2014 rotate first" }, 400);
+  }
   let sigOk = false;
   try {
     sigOk = ed25519.verify(
       b64urlToBytes(signature),
-      sigInput(spaceId, nonce, ciphertext),
+      version === 2 ? sig2Input(spaceId, epoch, nonce, ciphertext) : sigInput(spaceId, nonce, ciphertext),
       b64urlToBytes(pubkey)
     );
   } catch {
@@ -2298,7 +2374,7 @@ async function handlePostMessage(env, req, ip, spaceId) {
     const rand = Math.floor(Math.random() * 46656).toString(36).padStart(3, "0");
     id = `${String(ts).padStart(15, "0")}-${rand}`;
   }
-  const msg = { id, ts, ciphertext, nonce, pubkey, signature };
+  const msg = { id, ts, ciphertext, nonce, pubkey, signature, version, epoch };
   await env.RELAY_KV.put(`msg:${spaceId}:${id}`, JSON.stringify(msg), {
     expirationTtl: MSG_TTL
   });
@@ -2326,7 +2402,104 @@ async function handleGetMessages(env, url, spaceId) {
 async function handleGetMembers(env, spaceId) {
   const space = await getSpace(env, spaceId);
   if (!space) return json({ error: "unknown space" }, 404);
-  return json({ members: space.members });
+  return json({ members: space.members, epoch: space.epoch || 0 });
+}
+async function handleKick(env, req, ip, spaceId) {
+  if (await rateLimited(env, ip, "kick", 20))
+    return json({ error: "rate limited, try again shortly" }, 429);
+  const space = await getSpace(env, spaceId);
+  if (!space) return json({ error: "unknown space" }, 404);
+  let b;
+  try {
+    b = await readJson(req);
+  } catch {
+    return json({ error: "invalid JSON" }, 400);
+  }
+  const { pubkey, epoch, signature, keys, admin_x_pub, epoch_signature } = b;
+  if (!validPubkey(pubkey)) return json({ error: "bad pubkey" }, 400);
+  if (!validEpoch(epoch)) return json({ error: "bad epoch" }, 400);
+  if (!validSig(signature)) return json({ error: "bad signature" }, 400);
+  if (!space.members.some((m) => m.pubkey === pubkey))
+    return json({ error: "unknown member" }, 404);
+  if (epoch !== (space.epoch || 0) + 1)
+    return json({ error: "stale epoch" }, 400);
+  if (!verifyControlSig(
+    space.control_pub,
+    kickInput(spaceId, pubkey, epoch),
+    signature
+  ))
+    return json({ error: "bad kick signature" }, 403);
+  let bundle = null;
+  if (keys !== void 0 || admin_x_pub !== void 0 || epoch_signature !== void 0) {
+    if (!validXPubkey(admin_x_pub))
+      return json({ error: "bad admin_x_pub" }, 400);
+    if (!validSig(epoch_signature))
+      return json({ error: "bad epoch signature" }, 400);
+    if (!Array.isArray(keys) || keys.length > MAX_MEMBERS)
+      return json({ error: "bad keys" }, 400);
+    const remaining = space.members.filter((m) => m.pubkey !== pubkey);
+    for (const k of keys) {
+      if (!k || !validPubkey(k.pubkey) || typeof k.wrapped !== "string" || k.wrapped.length > MAX_WRAPPED_B64 || !RE_B64URL.test(k.wrapped))
+        return json({ error: "bad wrapped key" }, 400);
+      if (!remaining.some((m) => m.pubkey === k.pubkey))
+        return json({ error: "wrapped key for non-member" }, 400);
+    }
+    if (!verifyControlSig(
+      space.control_pub,
+      epochInput(spaceId, epoch),
+      epoch_signature
+    ))
+      return json({ error: "bad epoch signature" }, 403);
+    bundle = { epoch, admin_x_pub, keys };
+  }
+  space.members = space.members.filter((m) => m.pubkey !== pubkey);
+  space.epoch = epoch;
+  space.epoch_keys = bundle;
+  await putSpace(env, spaceId, space);
+  return json({ ok: true, epoch });
+}
+async function handleEpochKeysPost(env, req, ip, spaceId) {
+  if (await rateLimited(env, ip, "epochkeys", 20))
+    return json({ error: "rate limited, try again shortly" }, 429);
+  const space = await getSpace(env, spaceId);
+  if (!space) return json({ error: "unknown space" }, 404);
+  let b;
+  try {
+    b = await readJson(req);
+  } catch {
+    return json({ error: "invalid JSON" }, 400);
+  }
+  const { epoch, admin_x_pub, keys, signature } = b;
+  if (!validEpoch(epoch)) return json({ error: "bad epoch" }, 400);
+  if (!validXPubkey(admin_x_pub)) return json({ error: "bad admin_x_pub" }, 400);
+  if (!validSig(signature)) return json({ error: "bad signature" }, 400);
+  if (!Array.isArray(keys) || keys.length > MAX_MEMBERS)
+    return json({ error: "bad keys" }, 400);
+  for (const k of keys) {
+    if (!k || !validPubkey(k.pubkey) || typeof k.wrapped !== "string" || k.wrapped.length > MAX_WRAPPED_B64 || !RE_B64URL.test(k.wrapped))
+      return json({ error: "bad wrapped key" }, 400);
+    if (!space.members.some((m) => m.pubkey === k.pubkey))
+      return json({ error: "wrapped key for non-member" }, 400);
+  }
+  if (epoch !== (space.epoch || 0))
+    return json({ error: "stale epoch" }, 400);
+  if (!verifyControlSig(
+    space.control_pub,
+    epochInput(spaceId, epoch),
+    signature
+  ))
+    return json({ error: "bad epoch signature" }, 403);
+  space.epoch_keys = { epoch, admin_x_pub, keys };
+  await putSpace(env, spaceId, space);
+  return json({ ok: true, epoch });
+}
+async function handleEpochKeysGet(env, spaceId) {
+  const space = await getSpace(env, spaceId);
+  if (!space) return json({ error: "unknown space" }, 404);
+  if (!space.epoch_keys) {
+    return json({ epoch: space.epoch || 0, admin_x_pub: null, keys: [] });
+  }
+  return json(space.epoch_keys);
 }
 async function handleDelete(env, req, spaceId) {
   const space = await getSpace(env, spaceId);
@@ -2378,7 +2551,7 @@ var worker_default = {
         return await handleCreate(env, req, ip);
       if (path === "/api/spaces/join" && req.method === "POST")
         return await handleJoin(env, req, ip);
-      const m = path.match(/^\/api\/spaces\/([A-Za-z0-9_-]{22})\/(members|messages|control)$/);
+      const m = path.match(/^\/api\/spaces\/([A-Za-z0-9_-]{22})\/(members|messages|control|kick|epoch-keys)$/);
       if (m) {
         const [, spaceId, what] = m;
         if (what === "members" && req.method === "POST")
@@ -2391,6 +2564,12 @@ var worker_default = {
           return await handlePostMessage(env, req, ip, spaceId);
         if (what === "messages" && req.method === "GET")
           return await handleGetMessages(env, url, spaceId);
+        if (what === "kick" && req.method === "POST")
+          return await handleKick(env, req, ip, spaceId);
+        if (what === "epoch-keys" && req.method === "POST")
+          return await handleEpochKeysPost(env, req, ip, spaceId);
+        if (what === "epoch-keys" && req.method === "GET")
+          return await handleEpochKeysGet(env, spaceId);
       }
       const d = path.match(/^\/api\/spaces\/([A-Za-z0-9_-]{22})$/);
       if (d && req.method === "DELETE") return await handleDelete(env, req, d[1]);

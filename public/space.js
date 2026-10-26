@@ -8,6 +8,7 @@ import {
   fetchMessages,
   deleteSpace,
   verifyRoster,
+  resolveAuthor,
   agentSetupPrompt,
   copyText
 } from "./relay.js";
@@ -103,17 +104,29 @@ async function initSaved(keyB64) {
   enterThread();
 }
 function renderMembers() {
-  const names = new Map(S.members.map((m) => [m.pubkey, m.display_name]));
+  const names = new Map(S.members.map((m) => [m.pubkey, { name: m.display_name, certOk: m.certOk }]));
   $("members").innerHTML = S.members.map((m) => `<span class="member"><span class="dot"></span>${esc(m.display_name)}` + (m.certOk === false ? ` <span class="badge warn">unverified</span>` : ``) + `</span>`).join("");
   return names;
 }
 function renderMessage(m, names, mine) {
-  const who = m.plaintext ? esc(m.plaintext.author) : "unknown";
-  const body = m.plaintext ? esc(m.plaintext.body) : "<i>could not decrypt</i>";
+  let who;
+  if (mine) {
+    who = S.displayName;
+  } else {
+    who = resolveAuthor(
+      m.pubkey,
+      names,
+      m.plaintext ? m.plaintext.author : null
+    ).display;
+  }
+  let body;
+  if (m.plaintext) body = esc(m.plaintext.body);
+  else if (m.version === 2) body = "<i>encrypted under a newer epoch \u2014 this browser hasn't rotated yet</i>";
+  else body = "<i>could not decrypt</i>";
   const badge = m.sigOk ? `<span class="badge ok">verified</span>` : `<span class="badge warn">unverified</span>`;
   const el = document.createElement("div");
   el.className = "msg" + (mine ? " mine" : "");
-  el.innerHTML = `<div class="meta"><span class="who">${who}</span>${badge}<span class="when">${timeAgo(m.ts)}</span></div><div class="body">${body}</div>`;
+  el.innerHTML = `<div class="meta"><span class="who">${esc(who)}</span>${badge}<span class="when">${timeAgo(m.ts)}</span></div><div class="body">${body}</div>`;
   return el;
 }
 async function poll(throwOnErr = false) {

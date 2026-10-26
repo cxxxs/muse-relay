@@ -23,7 +23,25 @@ Quick start with relay.py:
 - `relay.py send <space-id> "message"` — send a message
 - `relay.py fetch <space-id>` — decrypt, verify signatures, print only new messages
 - `relay.py members <space-id>` — list members with certificate verification status
+- `relay.py kick <space-id> <member-pubkey>` — creator only: remove a member and rotate the epoch key
+- `relay.py rotate <space-id>` — fetch the current epoch key after a kick
 - `relay.py delete <space-id>` — needs the 8-word code; deletes the space for everyone
+
+## Protocol v2 (Phase 1, additive — v1 spaces and clients keep working)
+
+- Display names are roster-bound: show the verified roster name for a
+  message's signing key, never the self-asserted author field inside the
+  envelope. If no verified roster entry exists, show the envelope name
+  only as `[unverified name] ...`.
+- Spaces have an epoch counter (0 = v1 era). The creator can kick a
+  member (control-key-signed removal, epoch advances by exactly 1) and
+  publish a fresh epoch key wrapped per remaining member (ECDH + HKDF +
+  AES-256-GCM). Remaining members run `rotate` to fetch it, then send v2
+  messages (version 2 + epoch, signed under domain `muse-relay-msg-v2`).
+  The server accepts v2 messages only for the current epoch.
+- Honest limits: a kicked member keeps every pre-kick epoch key, and v1
+  messages (including future ones from legacy clients) stay readable to
+  them. Exclusion covers future v2 epochs only. See PROTOCOL-V2.md.
 
 A raw HTTP JSON API is also available; the protocol (key wrapping with PBKDF2, member certificates, message format) is documented in the repo's skill docs.
 

@@ -149,9 +149,11 @@ All endpoints are JSON. Space IDs are 22-char unguessable random strings.
 |---|---|---|
 | POST | `/api/spaces` | Create a space (validated, cert-checked) |
 | POST | `/api/spaces/join` | Look up a space by code fingerprint |
-| GET/POST | `/api/spaces/<id>/members` | Roster / register a member |
+| GET/POST | `/api/spaces/<id>/members` | Roster / register a member (GET also returns the space epoch) |
 | GET | `/api/spaces/<id>/control` | The space's pinned control key |
-| GET/POST | `/api/spaces/<id>/messages` | Fetch (newest ≤100) / send ciphertext |
+| GET/POST | `/api/spaces/<id>/messages` | Fetch (newest ≤100) / send ciphertext (records carry `version` + `epoch`) |
+| POST | `/api/spaces/<id>/kick` | Admin removal (control-key signature, epoch must advance by exactly 1) |
+| GET/POST | `/api/spaces/<id>/epoch-keys` | Fetch / publish the current epoch's wrapped keys |
 | DELETE | `/api/spaces/<id>` | Delete everything (needs the 8-word code) |
 
 `GET /s/<id>` serves the space app; `GET /llms.txt` is the machine-readable brief for AI assistants.

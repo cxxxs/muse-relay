@@ -15,7 +15,7 @@
  *               control seed. The server verifies certs before adding
  *               members, so it cannot forge participants.
  */
-import { ed25519 } from "@noble/curves/ed25519.js";
+import { ed25519, x25519 } from "@noble/curves/ed25519.js";
 import { WORDS } from "./words.js";
 
 const te = new TextEncoder();
@@ -246,6 +246,155 @@ export function verifyMessage(pubB64, spaceIdB64, nonceB64, ciphertextB64, sigB6
   } catch {
     return false;
   }
+}
+
+/* ---- Phase 1 (v2): epochs, kick, roster-bound identity ----
+ * These mirror relay.py exactly: same domains, same byte layouts, same
+ * HKDF parameters. A v1 signature must never verify as v2 or vice versa —
+ * the domains differ, so cross-version replay is impossible by
+ * construction. The web UI uses these for verification and epoch-key
+ * handling; it does not (yet) expose kick/rotate buttons — see
+ * PROTOCOL-V2.md. */
+
+export function epochBytes(epoch) {
+  const buf = new ArrayBuffer(8);
+  new DataView(buf).setBigUint64(0, BigInt(epoch));
+  return new Uint8Array(buf);
+}
+
+function sig2Input(spaceIdB64, epoch, nonceB64, ciphertextB64) {
+  const parts = [
+    te.encode("muse-relay-msg-v2"),
+    b64urlDecode(spaceIdB64),
+    epochBytes(epoch),
+    b64urlDecode(nonceB64),
+    b64urlDecode(ciphertextB64),
+  ];
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+
+function kickInput(spaceIdB64, pubB64, epoch) {
+  const parts = [
+    te.encode("muse-relay-kick-v1"),
+    b64urlDecode(spaceIdB64),
+    b64urlDecode(pubB64),
+    epochBytes(epoch),
+  ];
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+
+function epochInput(spaceIdB64, epoch) {
+  const parts = [
+    te.encode("muse-relay-epoch-v1"),
+    b64urlDecode(spaceIdB64),
+    epochBytes(epoch),
+  ];
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+
+export function signMessageV2(privB64, spaceIdB64, epoch, nonceB64, ciphertextB64) {
+  const sig = ed25519.sign(sig2Input(spaceIdB64, epoch, nonceB64, ciphertextB64),
+    b64urlDecode(privB64));
+  return b64urlEncode(sig);
+}
+
+export function verifyMessageV2(pubB64, spaceIdB64, epoch, nonceB64, ciphertextB64, sigB64) {
+  try {
+    return ed25519.verify(b64urlDecode(sigB64),
+      sig2Input(spaceIdB64, epoch, nonceB64, ciphertextB64), b64urlDecode(pubB64));
+  } catch {
+    return false;
+  }
+}
+
+export function signKick(seedB64, spaceIdB64, pubB64, epoch) {
+  const sig = ed25519.sign(kickInput(spaceIdB64, pubB64, epoch), b64urlDecode(seedB64));
+  return b64urlEncode(sig);
+}
+
+export function verifyKick(controlPubB64, spaceIdB64, pubB64, epoch, sigB64) {
+  try {
+    return ed25519.verify(b64urlDecode(sigB64),
+      kickInput(spaceIdB64, pubB64, epoch), b64urlDecode(controlPubB64));
+  } catch {
+    return false;
+  }
+}
+
+export function signEpochBundle(seedB64, spaceIdB64, epoch) {
+  const sig = ed25519.sign(epochInput(spaceIdB64, epoch), b64urlDecode(seedB64));
+  return b64urlEncode(sig);
+}
+
+export function verifyEpochBundle(controlPubB64, spaceIdB64, epoch, sigB64) {
+  try {
+    return ed25519.verify(b64urlDecode(sigB64),
+      epochInput(spaceIdB64, epoch), b64urlDecode(controlPubB64));
+  } catch {
+    return false;
+  }
+}
+
+/** A member's X25519 keypair, used only for epoch-key wrapping. Separate
+ *  from the Ed25519 signing keypair, exactly as in relay.py. */
+export function genXKeypair() {
+  const priv = x25519.utils.randomSecretKey();
+  const pub = x25519.getPublicKey(priv);
+  return { privB64: b64urlEncode(priv), pubB64: b64urlEncode(pub) };
+}
+
+export function x25519Shared(privB64, pubB64) {
+  return x25519.getSharedSecret(b64urlDecode(privB64), b64urlDecode(pubB64));
+}
+
+/** Derive the AES-256-GCM key that wraps one member's copy of an epoch
+ *  key. Parameters match relay.py epoch_wrapping_key exactly: HKDF-SHA256,
+ *  salt = the domain string, info = space id bytes || epoch (8-byte BE). */
+export async function epochWrappingKey(shared, spaceIdB64, epoch) {
+  const ikm = await crypto.subtle.importKey("raw", shared, "HKDF", false, ["deriveBits"]);
+  const infoParts = [b64urlDecode(spaceIdB64), epochBytes(epoch)];
+  const infoLen = infoParts.reduce((n, p) => n + p.length, 0);
+  const info = new Uint8Array(infoLen);
+  let o = 0;
+  for (const p of infoParts) { info.set(p, o); o += p.length; }
+  const bits = await crypto.subtle.deriveBits(
+    { name: "HKDF", hash: "SHA-256",
+      salt: te.encode("muse-relay-epoch-v1"), info },
+    ikm, 256);
+  return new Uint8Array(bits);
+}
+
+/** Wrap an epoch key: b64url(nonce[12] || AES-256-GCM(key, epoch_key)). */
+export async function wrapEpochKey(wrappingKey, epochKey) {
+  const nonce = randomBytes(12);
+  const ct = new Uint8Array(
+    await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce },
+      await importAesGcm(wrappingKey, ["encrypt"]), epochKey));
+  const blob = new Uint8Array(12 + ct.length);
+  blob.set(nonce, 0);
+  blob.set(ct, 12);
+  return b64urlEncode(blob);
+}
+
+export async function unwrapEpochKey(wrappingKey, wrappedB64) {
+  const blob = b64urlDecode(wrappedB64);
+  const pt = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: blob.slice(0, 12) },
+    await importAesGcm(wrappingKey, ["decrypt"]),
+    blob.slice(12));
+  return new Uint8Array(pt); // 32-byte epoch key
 }
 
 export function parseRelayLink(url) {
