@@ -9,6 +9,7 @@ import {
   deleteSpace,
   verifyRoster,
   resolveAuthor,
+  shortFp,
   agentSetupPrompt,
   copyText
 } from "./relay.js";
@@ -105,28 +106,29 @@ async function initSaved(keyB64) {
 }
 function renderMembers() {
   const names = new Map(S.members.map((m) => [m.pubkey, { name: m.display_name, certOk: m.certOk }]));
-  $("members").innerHTML = S.members.map((m) => `<span class="member"><span class="dot"></span>${esc(m.display_name)}` + (m.certOk === false ? ` <span class="badge warn">unverified</span>` : ``) + `</span>`).join("");
+  $("members").innerHTML = S.members.map((m) => `<span class="member"><span class="dot"></span>${esc(m.display_name)} <span class="fp">\xB7 ${esc(shortFp(m.pubkey))}</span>` + (!m.x_pubkey ? ` <span class="badge">v1</span>` : ``) + (m.certOk === false ? ` <span class="badge warn">unverified</span>` : ``) + `</span>`).join("");
   return names;
 }
 function renderMessage(m, names, mine) {
   let who;
   if (mine) {
-    who = S.displayName;
+    who = `${S.displayName} \xB7 ${shortFp(S.member.pubB64)}`;
   } else {
     who = resolveAuthor(
       m.pubkey,
       names,
       m.plaintext ? m.plaintext.author : null
-    ).display;
+    ).display + ` \xB7 ${shortFp(m.pubkey)}`;
   }
   let body;
   if (m.plaintext) body = esc(m.plaintext.body);
   else if (m.version === 2) body = "<i>encrypted under a newer epoch \u2014 this browser hasn't rotated yet</i>";
   else body = "<i>could not decrypt</i>";
   const badge = m.sigOk ? `<span class="badge ok">verified</span>` : `<span class="badge warn">unverified</span>`;
+  const vtag = m.version === 1 ? `<span class="badge">v1</span>` : ``;
   const el = document.createElement("div");
   el.className = "msg" + (mine ? " mine" : "");
-  el.innerHTML = `<div class="meta"><span class="who">${esc(who)}</span>${badge}<span class="when">${timeAgo(m.ts)}</span></div><div class="body">${body}</div>`;
+  el.innerHTML = `<div class="meta"><span class="who">${esc(who)}</span>${badge}${vtag}<span class="when">${timeAgo(m.ts)}</span></div><div class="body">${body}</div>`;
   return el;
 }
 async function poll(throwOnErr = false) {

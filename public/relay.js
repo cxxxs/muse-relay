@@ -4785,6 +4785,9 @@ async function sendMessage(base, spaceId, keyB64, member, author, body) {
     })
   });
 }
+function shortFp(pubkey) {
+  return (pubkey || "").slice(0, 6);
+}
 function resolveAuthor(pubkey, names, plaintextAuthor) {
   const entry = names ? names.get(pubkey) : null;
   if (entry && entry.certOk) return { display: entry.name, verified: true };
@@ -4876,6 +4879,7 @@ export {
   resolveAuthor,
   sendMessage,
   sha256,
+  shortFp,
   signEpochBundle,
   signKick,
   signMemberCert,

@@ -189,6 +189,14 @@ export async function sendMessage(base, spaceId, keyB64, member, author, body) {
   });
 }
 
+/** Short key fingerprint for display: the first 6 characters of the
+ *  base64url pubkey. Mirrors relay.py short_fp. It is a DISPLAY
+ *  disambiguator — it tells duplicate display names apart at a glance —
+ *  not a security identifier; pinning must use the full pubkey. */
+export function shortFp(pubkey) {
+  return (pubkey || "").slice(0, 6);
+}
+
 /** Roster-bound display name. names is a Map of pubkey -> {name, certOk}.
  * Mirrors relay.py resolve_author: the plaintext author field inside the
  * envelope is SELF-ASSERTED and is never displayed when a verified roster

@@ -11,9 +11,11 @@ Usage:
     relay.py send <space-id> "Tell my friend's assistant we're on for Friday"
     relay.py fetch <space-id>            # decrypt + verify, append to audit log
     relay.py members <space-id>
-    relay.py kick <space-id> <member-pubkey>   # creator only: remove + rotate
-    relay.py republish <space-id>        # creator only: re-upload epoch keys
+    relay.py kick <space-id> <member-pubkey>   # seed holder: remove + rotate
+    relay.py republish <space-id>        # seed holder: re-upload epoch keys
     relay.py rotate <space-id>           # fetch the current epoch key
+    relay.py rotate-key <space-id>      # seed holder + code: rotate link key
+    relay.py rotate-epoch <space-id>    # seed holder: advance epoch, no removal
     relay.py delete <space-id>           # needs the 8-word code
 
 Set the relay server with --base or the MUSE_RELAY_BASE environment variable.
@@ -28,6 +30,7 @@ import hashlib
 import json
 import os
 import secrets
+import subprocess
 import sys
 import time
 import urllib.request
@@ -195,6 +198,40 @@ def verify_epoch_bundle(control_pub_b64: str, space_id: str, epoch: int,
         return False
 
 
+# Link-key rotation signatures. The statement binds BOTH new wrapped
+# blobs, so a rotation request cannot be repurposed to rotate one blob
+# but not the other. Must match src/worker.js rotateKeyInput exactly:
+# domain || raw space-id bytes || raw new wrapped_control ||
+# raw new wrapped (code-path blob).
+ROTATEKEY_CTX = b"muse-relay-rotatekey-v1"
+
+
+def _rotatekey_input(space_id: str, wrapped_control_b64: str,
+                     wrapped_b64: str) -> bytes:
+    return (ROTATEKEY_CTX + b64d(space_id) + b64d(wrapped_control_b64)
+            + b64d(wrapped_b64))
+
+
+def sign_rotate_key(seed_b64: str, space_id: str,
+                    wrapped_control_b64: str, wrapped_b64: str) -> str:
+    seed = Ed25519PrivateKey.from_private_bytes(b64d(seed_b64))
+    return b64e(seed.sign(
+        _rotatekey_input(space_id, wrapped_control_b64, wrapped_b64)))
+
+
+def verify_rotate_key(control_pub_b64: str, space_id: str,
+                      wrapped_control_b64: str, wrapped_b64: str,
+                      sig_b64: str) -> bool:
+    try:
+        pub = Ed25519PublicKey.from_public_bytes(b64d(control_pub_b64))
+        pub.verify(b64d(sig_b64),
+                   _rotatekey_input(space_id, wrapped_control_b64,
+                                    wrapped_b64))
+        return True
+    except (InvalidSignature, ValueError):
+        return False
+
+
 def sign_message_v2(priv_b64: str, space_id: str, epoch: int,
                     nonce_b64: str, ct_b64: str) -> str:
     priv = Ed25519PrivateKey.from_private_bytes(b64d(priv_b64))
@@ -278,6 +315,47 @@ def resolve_author(pub_b64: str, roster: dict, plaintext_author):
     if plaintext_author:
         return f"[unverified name] {plaintext_author}", False
     return "[unverified name]", False
+
+
+def check_control_fp(control_pub_b64: str, expect):
+    """Second-channel control-key pinning for joins.
+
+    expect may be the full base64url control pubkey or its short
+    fingerprint (short_fp). Raises ValueError on mismatch; None means
+    'do not pin' (the default: joining trusts the link alone).
+
+    The fingerprint MUST arrive via a second channel — a fingerprint
+    pasted in the same message as the link adds nothing, because anyone
+    who can swap the link can swap the fingerprint with it. Its value
+    is binding the link to the EXPECTED creator's space: confirming
+    this link corresponds to their space, not another space on the same
+    hostname. It is NOT about preventing server forgery: for an
+    honestly-created space the server cannot forge control keys anyway,
+    because the client derives control_pub from the seed unwrapped with
+    the space key (which the server never sees) and aborts on mismatch
+    with the server's claim (see control_pub_from_seed)."""
+    if expect is None:
+        return
+    expect = expect.strip()
+    if expect != control_pub_b64 and expect != short_fp(control_pub_b64):
+        raise ValueError(
+            "control pubkey fingerprint mismatch: the link's control key "
+            "does not match the expected fingerprint — the link may point "
+            "at a different space than expected; refusing to join")
+def short_fp(pub_b64: str) -> str:
+    """Stable short fingerprint of a member/control public key: the first
+    6 characters of its base64url form. It is a DISPLAY disambiguator,
+    not a security identifier: it tells humans apart when two members
+    share a display name (names are self-asserted and not unique), but
+    pinning must use the full pubkey (or the --expect-control-fp check),
+    never the short form alone. The same rule is used by the web UI."""
+    return (pub_b64 or "")[:6]
+
+
+def display_with_fp(display_name: str, pub_b64: str) -> str:
+    """Display name with its key fingerprint: 'jojo · a3f9x2'. A duplicate
+    name with a different fingerprint is visibly a different member."""
+    return f"{display_name} · {short_fp(pub_b64)}"
 
 
 # ---------------------------------------------------------------- crypto
@@ -369,6 +447,95 @@ def verify_message(pub_b64: str, space_id: str, nonce_b64: str, ct_b64: str,
 
 LOCAL_KEY_FILE = os.path.join(CONFIG_DIR, ".local-key")
 
+_KEYCHAIN_SERVICE = "muse-relay"
+_KEYCHAIN_ACCOUNT = "local-key"
+_KEYCHAIN_WARNED = False
+# In-process memoization: a hung or missing keychain tool is tried once
+# per process, not once per state operation — a CLI invocation does
+# several state reads/writes, and a 10s timeout on each would be absurd.
+_KEYCHAIN_DEAD = False
+_KEYCHAIN_PUT_OK = False
+
+
+def _keychain_tool():
+    """Return the platform keychain CLI name, or None when no supported
+    tool exists. macOS uses `security`, Linux uses `secret-tool`
+    (Secret Service). Other platforms have no keychain backend."""
+    if sys.platform == "darwin":
+        return "security"
+    if sys.platform.startswith("linux"):
+        return "secret-tool"
+    return None
+
+
+def _keychain_get():
+    """Return the stored local key (bytes) or None. Never raises, never
+    prompts: a missing tool, a locked keychain, denied access, or a
+    timeout all mean 'unavailable' and the caller falls back to the
+    file. The key is stored base64-encoded; anything else is rejected.
+    A hung/missing tool marks the keychain dead for this process."""
+    global _KEYCHAIN_DEAD
+    if _keychain_tool() is None or _KEYCHAIN_DEAD:
+        return None
+    try:
+        if sys.platform == "darwin":
+            out = subprocess.run(
+                ["security", "find-generic-password",
+                 "-s", _KEYCHAIN_SERVICE, "-a", _KEYCHAIN_ACCOUNT, "-w"],
+                capture_output=True, text=True, timeout=10)
+        else:
+            out = subprocess.run(
+                ["secret-tool", "lookup",
+                 _KEYCHAIN_SERVICE, _KEYCHAIN_ACCOUNT],
+                capture_output=True, text=True, timeout=10)
+        if out.returncode != 0:
+            return None
+        raw = b64d(out.stdout.strip())
+        return raw if len(raw) == 32 else None
+    except Exception:
+        _KEYCHAIN_DEAD = True
+        return None
+
+
+def _keychain_put(key: bytes) -> bool:
+    """Best-effort store of the local key in the keychain. Returns True
+    on success, False otherwise (the caller keeps the file). Never
+    raises, never prompts: secret-tool reads the secret from stdin, and
+    the security invocation is non-interactive with a timeout. A
+    successful put is remembered for this process; a hung/missing tool
+    marks the keychain dead for this process."""
+    global _KEYCHAIN_DEAD, _KEYCHAIN_PUT_OK
+    if _keychain_tool() is None or _KEYCHAIN_DEAD or _KEYCHAIN_PUT_OK:
+        return _KEYCHAIN_PUT_OK
+    encoded = b64e(key)
+    try:
+        if sys.platform == "darwin":
+            out = subprocess.run(
+                ["security", "add-generic-password",
+                 "-s", _KEYCHAIN_SERVICE, "-a", _KEYCHAIN_ACCOUNT,
+                 "-w", encoded, "-U"],
+                capture_output=True, text=True, timeout=10)
+        else:
+            out = subprocess.run(
+                ["secret-tool", "store", "--label", "Muse Relay local key",
+                 _KEYCHAIN_SERVICE, _KEYCHAIN_ACCOUNT],
+                input=encoded, capture_output=True, text=True, timeout=10)
+        if out.returncode == 0:
+            _KEYCHAIN_PUT_OK = True
+            return True
+        return False
+    except Exception:
+        _KEYCHAIN_DEAD = True
+        return False
+
+
+def _write_local_key_file(key: bytes):
+    tmp = LOCAL_KEY_FILE + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(key)
+    os.chmod(tmp, 0o400)
+    os.replace(tmp, LOCAL_KEY_FILE)
+
 
 def _local_key() -> bytes:
     """The at-rest key for local space-state files (see save_space).
@@ -379,8 +546,50 @@ def _local_key() -> bytes:
     full access to this machine, because the key itself lives on the same
     machine. It is defense in depth, not a security boundary. The audit
     logs (audit/*.log) are deliberately NOT covered: they are the agent's
-    own decrypted record and stay plaintext."""
+    own decrypted record and stay plaintext.
+
+    Storage backends (MUSE_RELAY_KEY_BACKEND, default "auto"):
+    - "auto": the OS keychain first (macOS Keychain via `security`,
+      Linux Secret Service via `secret-tool`), falling back to the file
+      with a one-time-per-process stderr warning when the keychain is
+      locked or unavailable. A file key found while the keychain is
+      available is also copied into the keychain (best-effort
+      migration); the file stays as the fallback.
+    - "keychain": same as auto, except the warning is the point: an
+      operator who explicitly asked for the keychain wants to know when
+      it is not engaged.
+    - "file" (or any other value): the historical 0400 file only.
+    The unattended poll path must keep working, so a locked or missing
+    keychain NEVER blocks and NEVER prompts: it falls back, it warns
+    once, and the run proceeds. First-time macOS access may prompt once
+    at interactive setup; an unattended run that hits that prompt times
+    out (10s) and falls back.
+    Honest limits: the macOS path cannot be live-tested on this Linux
+    VM (code-review only), and on a headless Linux box Secret Service
+    is usually absent, so the file fallback is the normal path there."""
+    global _KEYCHAIN_WARNED
+    backend = os.environ.get("MUSE_RELAY_KEY_BACKEND", "auto")
     os.makedirs(CONFIG_DIR, exist_ok=True)
+    if backend in ("auto", "keychain"):
+        key = _keychain_get()
+        if key is not None:
+            return key
+        if os.path.exists(LOCAL_KEY_FILE):
+            with open(LOCAL_KEY_FILE, "rb") as f:
+                key = f.read()
+            if len(key) != 32:
+                raise ValueError("local key file is corrupt (not 32 bytes)")
+            # Best-effort migration into the keychain; the file stays.
+            _keychain_put(key)
+            if not _KEYCHAIN_WARNED:
+                _KEYCHAIN_WARNED = True
+                print("warning: keychain unavailable, using local key file",
+                      file=sys.stderr)
+            return key
+        key = secrets.token_bytes(32)
+        _keychain_put(key)
+        _write_local_key_file(key)
+        return key
     if os.path.exists(LOCAL_KEY_FILE):
         with open(LOCAL_KEY_FILE, "rb") as f:
             key = f.read()
@@ -388,11 +597,7 @@ def _local_key() -> bytes:
             raise ValueError("local key file is corrupt (not 32 bytes)")
         return key
     key = secrets.token_bytes(32)
-    tmp = LOCAL_KEY_FILE + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(key)
-    os.chmod(tmp, 0o400)
-    os.replace(tmp, LOCAL_KEY_FILE)
+    _write_local_key_file(key)
     return key
 
 
@@ -462,7 +667,7 @@ def audit(space_id: str, entries):
     os.makedirs(AUDIT_DIR, exist_ok=True)
     seen = set()
     if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 try:
                     seen.add(json.loads(line)["id"])
@@ -480,6 +685,178 @@ def audit(space_id: str, entries):
             }) + "\n")
     os.chmod(path, 0o600)
     return len(new)
+
+
+# ---------------------------------------------------------------- roster history (anti-rollback)
+
+def roster_hash(members) -> str:
+    """Hash of a roster snapshot: sorted 'pubkey:display_name' lines.
+
+    The hash is over public data (pubkeys and self-asserted names), so it
+    is safe to persist and to show in warnings."""
+    lines = sorted(f"{m['pubkey']}:{m.get('display_name', '')}"
+                   for m in members)
+    return hashlib.sha256("\n".join(lines).encode()).hexdigest()
+
+
+def _roster_notices(prev, epoch: int, members, history):
+    """Compare a fresh roster observation against recorded history.
+
+    prev is the last recorded observation
+    {"epoch", "hash", "members": [{"pubkey", "display_name"}]} or None.
+    history is the list of past {"epoch", "hash"} observations.
+    Returns (notices, observation) where notices is a list of
+    {"level", "type", "detail"} dicts. Levels: 'warning' for rollback
+    signals, 'notice' for ordinary roster changes.
+
+    Rules (see PROTOCOL-V2.md, roster anti-rollback):
+    - epoch decreases -> warning (a server-side rollback shows up here
+      first, because a rolled-back space record carries its old epoch).
+    - a member disappears without an epoch increase -> warning. A
+      legitimate kick always bumps the epoch, so a disappearance at the
+      same epoch means the server is hiding a member.
+    - the roster hash returns to a previously seen hash while the epoch
+      is at or below the epoch at which the previous roster was last
+      seen -> warning. A legitimate kick that returns the roster to an
+      earlier shape does NOT trip this: the kick bumps the epoch past
+      the previous roster's epoch.
+    - any other roster change -> plain notice. Roster changes are
+      generic client behavior: every caller of members() sees them, not
+      just polling integrations.
+
+    Limits, stated plainly: a brand-new joiner has no history and cannot
+    detect a rollback; and these checks catch a server showing stale
+    state, not a server that invents a wholly new roster (that is what
+    certificate verification is for)."""
+    notices = []
+    now_hash = roster_hash(members)
+    now_pubkeys = {m["pubkey"] for m in members}
+    if prev is None:
+        return notices, {"epoch": epoch, "hash": now_hash,
+                         "members": [{"pubkey": m["pubkey"],
+                                      "display_name": m.get("display_name", "")}
+                                     for m in members]}
+    prev_epoch = prev["epoch"]
+    prev_hash = prev["hash"]
+    prev_pubkeys = {m["pubkey"] for m in prev["members"]}
+    prev_names = {m["pubkey"]: m.get("display_name", "")
+                  for m in prev["members"]}
+    if epoch < prev_epoch:
+        notices.append({"level": "warning", "type": "epoch_decreased",
+                        "detail": f"epoch decreased {prev_epoch} -> {epoch} "
+                                  f"(possible rollback)"})
+    vanished = prev_pubkeys - now_pubkeys
+    if vanished and epoch <= prev_epoch:
+        names = ", ".join(
+            f"{prev_names.get(p, '?')} · {short_fp(p)}"
+            for p in sorted(vanished))
+        notices.append({"level": "warning", "type": "member_vanished",
+                        "detail": f"member(s) disappeared without an epoch "
+                                  f"increase: {names} (possible rollback)"})
+    if now_hash != prev_hash:
+        joined = now_pubkeys - prev_pubkeys
+        left = prev_pubkeys - now_pubkeys
+        parts = []
+        if joined:
+            names = ", ".join(
+                f"{next(m.get('display_name', '') for m in members if m['pubkey'] == p)} · {short_fp(p)}"
+                for p in sorted(joined))
+            parts.append(f"joined {names}")
+        if left:
+            names = ", ".join(
+                f"{prev_names.get(p, '?')} · {short_fp(p)}"
+                for p in sorted(left))
+            parts.append(f"left {names}")
+        if not parts:
+            parts.append("roster changed (names or keys differ)")
+        # Revert check: the new hash was seen before, and the epoch is
+        # at or below the epoch at which the PREVIOUS roster was last
+        # observed. A kick returning the roster to an earlier shape
+        # bumps the epoch past that point, so it does not trip this.
+        prev_last_epoch = prev_epoch
+        for entry in history:
+            if entry.get("hash") == prev_hash:
+                prev_last_epoch = max(prev_last_epoch,
+                                      entry.get("epoch", 0))
+        seen_hashes = {e.get("hash") for e in history}
+        if now_hash in seen_hashes and epoch <= prev_last_epoch:
+            notices.append({"level": "warning", "type": "roster_reverted",
+                            "detail": "roster reverted to a previously seen "
+                                      "state (possible rollback)"})
+        else:
+            notices.append({"level": "notice", "type": "roster_changed",
+                            "detail": "roster changed: " + "; ".join(parts),
+                            "joined": sorted(joined),
+                            "left": sorted(left)})
+    return notices, {"epoch": epoch, "hash": now_hash,
+                     "members": [{"pubkey": m["pubkey"],
+                                  "display_name": m.get("display_name", "")}
+                                 for m in members]}
+
+
+def _audit_notice(space_id: str, notice):
+    """Record a roster notice in the per-space audit log (best effort).
+
+    Notice lines carry no 'id', so audit()'s seen-set computation skips
+    them; they never disturb message dedup."""
+    try:
+        path = os.path.join(AUDIT_DIR, space_id + ".log")
+        os.makedirs(AUDIT_DIR, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "type": "roster-notice", "ts": int(time.time() * 1000),
+                "level": notice["level"], "notice_type": notice["type"],
+                "detail": notice["detail"],
+            }) + "\n")
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+
+
+def _record_roster(space_id: str, epoch: int, members):
+    """Record a roster observation in the local space state and return
+    any notices it raises. Never raises: history bookkeeping must not
+    break a roster read (fetch/send flows depend on members())."""
+    try:
+        s = load_space(space_id)
+    except Exception as e:
+        return [{"level": "warning", "type": "history_error",
+                 "detail": f"roster history could not be recorded: {e}"}]
+    try:
+        prev = s.get("roster_last")
+        history = s.get("roster_history", [])
+        notices, observation = _roster_notices(prev, epoch, members,
+                                               history)
+        s["roster_last"] = observation
+        last = history[-1] if history else None
+        if (last is None or last.get("hash") != observation["hash"]
+                or last.get("epoch") != observation["epoch"]):
+            history = history + [{"epoch": observation["epoch"],
+                                  "hash": observation["hash"]}]
+            s["roster_history"] = history[-50:]
+        save_space(s)
+        for n in notices:
+            _audit_notice(space_id, n)
+        return notices
+    except Exception as e:
+        return [{"level": "warning", "type": "history_error",
+                 "detail": f"roster history could not be recorded: {e}"}]
+
+
+def _save_merged(s: dict):
+    """Save space state, preserving roster-history keys written by a
+    nested members() call after s was loaded. members() records roster
+    observations in the state file; a caller that later saves its own
+    stale in-memory copy must not clobber them. Best effort: on any
+    load failure the caller's copy is saved as-is."""
+    try:
+        fresh = load_space(s["space_id"])
+        for k in ("roster_last", "roster_history"):
+            if k in fresh:
+                s[k] = fresh[k]
+    except Exception:
+        pass
+    save_space(s)
 
 
 # ---------------------------------------------------------------- API
@@ -582,7 +959,8 @@ class Relay:
         return {"pub_b64": pub_b64, "priv_b64": priv_b64,
                 "x_pub_b64": x_pub_b64, "x_priv_b64": x_priv_b64}
 
-    def join_code(self, code: str, display_name: str) -> dict:
+    def join_code(self, code: str, display_name: str,
+                  expect_control_fp=None) -> dict:
         words = code.strip().lower().split()
         if len(words) != 8:
             raise ValueError("code must be 8 words")
@@ -598,6 +976,8 @@ class Relay:
         if data.get("control_pub") != ctrl_pub:
             raise RuntimeError("control key mismatch: server's control_pub does "
                                "not match the unwrapped control seed")
+        # Optional second-channel pinning (see check_control_fp).
+        check_control_fp(ctrl_pub, expect_control_fp)
         member = self._register(data["space_id"], ctrl_seed, display_name)
         s = {
             "space_id": data["space_id"], "key_b64": b64e(space_key),
@@ -612,7 +992,8 @@ class Relay:
         save_space(s)
         return s
 
-    def join_link(self, link: str, display_name: str) -> dict:
+    def join_link(self, link: str, display_name: str,
+                  expect_control_fp=None) -> dict:
         if "#k=" not in link:
             raise ValueError("not a Muse Relay link (missing #k= fragment)")
         head, key_b64 = link.split("#k=", 1)
@@ -626,6 +1007,8 @@ class Relay:
         if ctrl.get("control_pub") != ctrl_pub:
             raise RuntimeError("control key mismatch: server's control_pub does "
                                "not match the unwrapped control seed")
+        # Optional second-channel pinning (see check_control_fp).
+        check_control_fp(ctrl_pub, expect_control_fp)
         member = self._register(space_id, ctrl_seed, display_name)
         s = {
             "space_id": space_id, "key_b64": key_b64, "code": None,
@@ -661,7 +1044,13 @@ class Relay:
         # The server epoch rides along so kick/rotate know what the next
         # epoch number must be. Old servers omit it; epoch 0 is the safe
         # reading of "no rotation has happened".
-        return {"members": data, "epoch": resp.get("epoch", 0)}
+        # Roster anti-rollback: every roster read is recorded in local
+        # state and compared against history; see _record_roster. The
+        # notices are returned (and printed by the CLI) as generic client
+        # behavior, not just polling policy.
+        notices = _record_roster(space_id, resp.get("epoch", 0), data)
+        return {"members": data, "epoch": resp.get("epoch", 0),
+                "notices": notices}
 
     def send(self, space_id: str, body: str):
         s = load_space(space_id)
@@ -730,9 +1119,15 @@ class Relay:
         # Roster for display-name binding. Best effort: if the roster fetch
         # fails, every name falls back to a clearly-marked unverified form
         # instead of silently trusting the self-asserted author field.
+        # Roster notices (anti-rollback) go to stderr: pollers capture
+        # stdout, warnings belong on the other channel.
         roster = {}
         try:
-            for m in self.members(space_id)["members"]:
+            resp = self.members(space_id)
+            for n in resp.get("notices", []):
+                print(f"roster {n['level']}: {n['detail']}",
+                      file=sys.stderr)
+            for m in resp["members"]:
                 roster[m["pubkey"]] = (m["display_name"], bool(m.get("cert_ok")))
         except Exception:
             roster = {}
@@ -768,15 +1163,34 @@ class Relay:
                             f"is at epoch {s.get('epoch', 0)} — run `rotate` "
                             "to fetch the current epoch key")
             else:
-                try:
-                    pt = decrypt_message(key, m["nonce"], m["ciphertext"])
-                    author, body = pt.get("author"), pt.get("body")
-                except Exception:
+                # v1 messages use the space key. After a link-key
+                # rotation the current key no longer opens pre-rotation
+                # messages, so try the retained key history too.
+                # Rotation is forward-only by design: old keys still
+                # decrypt old messages.
+                pt = None
+                candidate_keys = [key]
+                for h in s.get("key_history_b64", []):
+                    try:
+                        candidate_keys.append(b64d(h))
+                    except Exception:
+                        continue
+                for k in candidate_keys:
+                    try:
+                        pt = decrypt_message(k, m["nonce"],
+                                             m["ciphertext"])
+                        break
+                    except Exception:
+                        continue
+                if pt is None:
                     decrypt_ok = False
+                else:
+                    author, body = pt.get("author"), pt.get("body")
             display, display_ok = resolve_author(m["pubkey"], roster, author)
             out.append({**m, "sig_ok": sig_ok, "decrypt_ok": decrypt_ok,
                         "author": author, "body": body,
                         "author_display": display,
+                        "author_fp": short_fp(m["pubkey"]),
                         "author_verified": display_ok,
                         "note": note,
                         "mine": m["pubkey"] == s["member"]["pub_b64"]})
@@ -863,7 +1277,7 @@ class Relay:
         # leaving the space kicked-but-keyless.
         s["pending_epoch"] = {"epoch": new_epoch,
                               "key_b64": b64e(epoch_key)}
-        save_space(s)
+        _save_merged(s)
         wrapped, left_behind = self._wrap_epoch_key(
             space_id, roster, target_pub_b64, epoch_key, new_epoch, s)
         # ATOMIC kick: the removal and the wrapped epoch keys travel in
@@ -895,7 +1309,7 @@ class Relay:
                 s["epoch"] = new_epoch
                 s["epoch_key_b64"] = b64e(epoch_key)
                 s.pop("pending_epoch", None)
-                save_space(s)
+                _save_merged(s)
                 return {"epoch": new_epoch,
                         "kicked": target["display_name"],
                         "left_behind": left_behind, "recovered": True}
@@ -903,7 +1317,7 @@ class Relay:
         s["epoch"] = new_epoch
         s["epoch_key_b64"] = b64e(epoch_key)
         s.pop("pending_epoch", None)
-        save_space(s)
+        _save_merged(s)
         return {"epoch": new_epoch, "kicked": target["display_name"],
                 "left_behind": left_behind}
 
@@ -935,7 +1349,7 @@ class Relay:
         s["epoch"] = server_epoch
         s["epoch_key_b64"] = b64e(epoch_key)
         s.pop("pending_epoch", None)
-        save_space(s)
+        _save_merged(s)
         return {"epoch": server_epoch, "published": True}
 
     def rotate(self, space_id: str):
@@ -982,8 +1396,124 @@ class Relay:
         epoch_key = unwrap_epoch_key(wk, entry["wrapped"])
         s["epoch"] = server_epoch
         s["epoch_key_b64"] = b64e(epoch_key)
-        save_space(s)
+        _save_merged(s)
         return {"epoch": server_epoch, "rotated": True}
+
+    def _control_seed_for(self, s: dict, space_id: str) -> str:
+        """Obtain the control seed for admin operations. The creator
+        stores it in local state; anyone else holding the 8-word code
+        can derive it through the code-unwrap chain (which is exactly
+        why seed holders — not just 'the creator' — hold admin rights).
+        Raises RuntimeError if neither is available."""
+        if s.get("control_seed"):
+            return s["control_seed"]
+        if s.get("code"):
+            words = s["code"].split()
+            lookup = derive_lookup(words)
+            data = self._req("POST", "/api/spaces/join", {"lookup": lookup})
+            kek = derive_kek(words, lookup)
+            space_key = unwrap_space_key(kek, data["wrapped"])
+            return unwrap_control_seed(space_key, data["wrapped_control"])
+        raise RuntimeError(
+            "need the control seed or the 8-word code for this operation")
+
+    def rotate_key(self, space_id: str):
+        """Rotate the link key (the join credential). Needs the control
+        seed (for the rotation signature) and the 8-word code (to
+        re-wrap the code-path blob — otherwise code joins would still
+        yield the old key).
+
+        FORWARD-ONLY, like kick: the old link can no longer join, but
+        existing members are NOT evicted (use kick for that) and old v1
+        messages stay readable — the old key is retained in local key
+        history so this device can still decrypt them. Epoch and members
+        are untouched. Returns {"space_id", "link", "epoch"}; the CLI
+        prints the new link (distribute it through the usual channel)
+        and the epoch-0 warning."""
+        s = load_space(space_id)
+        if not s.get("code"):
+            raise RuntimeError(
+                "need the 8-word code to rotate the link key: the "
+                "code-path wrapped blob must be re-wrapped under the new "
+                "key, or code joins would still yield the old key")
+        seed = self._control_seed_for(s, space_id)
+        words = s["code"].split()
+        lookup = derive_lookup(words)
+        kek = derive_kek(words, lookup)
+        new_key = secrets.token_bytes(32)
+        new_wrapped_control = wrap_control_seed(new_key, seed)
+        new_wrapped = wrap_space_key(kek, new_key)
+        sig = sign_rotate_key(seed, space_id,
+                              new_wrapped_control, new_wrapped)
+        self._req("POST", f"/api/spaces/{space_id}/rotate-key",
+                  {"wrapped_control": new_wrapped_control,
+                   "wrapped": new_wrapped, "signature": sig})
+        history = [s["key_b64"]] + s.get("key_history_b64", [])
+        s["key_history_b64"] = history[:5]
+        s["key_b64"] = b64e(new_key)
+        s["link"] = f"{self.base}/s/{space_id}#k={b64e(new_key)}"
+        save_space(s)
+        return {"space_id": space_id, "link": s["link"],
+                "epoch": s.get("epoch", 0)}
+
+    def rotate_epoch(self, space_id: str):
+        """Advance the epoch key WITHOUT removing anyone (kickless
+        rotation). Needs the control seed (signature) and an X25519
+        member key (wrapping); any seed holder can do it, under the
+        same honest model as kick. Members re-run `rotate` to fetch
+        the new key, exactly as after a kick. Returns {"epoch",
+        "left_behind"} (members without an X25519 key stay on v1).
+        Weekly use: run this on a schedule to shrink each epoch's blast
+        radius — it is the command the weekly-rotation cron calls."""
+        s = load_space(space_id)
+        seed = self._control_seed_for(s, space_id)
+        if not s["member"].get("x_priv_b64"):
+            raise RuntimeError(
+                "this device has no X25519 member key — rejoin with a "
+                "rotation-capable client first")
+        resp = self.members(space_id)
+        roster = resp["members"]
+        server_epoch = resp.get("epoch", 0)
+        new_epoch = server_epoch + 1
+        epoch_key = secrets.token_bytes(32)
+        # Save the pending epoch BEFORE any network call (same RST
+        # reasoning as kick): a lost response must not leave the space
+        # rotated-but-keyless locally.
+        s["pending_epoch"] = {"epoch": new_epoch,
+                              "key_b64": b64e(epoch_key)}
+        _save_merged(s)
+        wrapped, left_behind = self._wrap_epoch_key(
+            space_id, roster, None, epoch_key, new_epoch, s)
+        body = {"epoch": new_epoch, "keys": wrapped,
+                "admin_x_pub": s["member"]["x_pub_b64"],
+                "signature": sign_epoch_bundle(seed, space_id, new_epoch)}
+        try:
+            self._req("POST", f"/api/spaces/{space_id}/rotate-epoch", body)
+        except RuntimeError as e:
+            if "stale epoch" not in str(e):
+                raise
+            # Maybe our rotation already applied and the response was
+            # lost. Heal by republishing the bundle for the new epoch.
+            resp2 = self.members(space_id)
+            if resp2.get("epoch", 0) == new_epoch:
+                self._req("POST", f"/api/spaces/{space_id}/epoch-keys",
+                          {"epoch": new_epoch,
+                           "admin_x_pub": s["member"]["x_pub_b64"],
+                           "keys": wrapped,
+                           "signature": sign_epoch_bundle(
+                               seed, space_id, new_epoch)})
+                s["epoch"] = new_epoch
+                s["epoch_key_b64"] = b64e(epoch_key)
+                s.pop("pending_epoch", None)
+                _save_merged(s)
+                return {"epoch": new_epoch, "left_behind": left_behind,
+                        "recovered": True}
+            raise
+        s["epoch"] = new_epoch
+        s["epoch_key_b64"] = b64e(epoch_key)
+        s.pop("pending_epoch", None)
+        _save_merged(s)
+        return {"epoch": new_epoch, "left_behind": left_behind}
 
     def delete(self, space_id: str):
         s = load_space(space_id)
@@ -1010,13 +1540,25 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("create"); p.add_argument("--name", required=True)
     p = sub.add_parser("join-code"); p.add_argument("code"); p.add_argument("--name", required=True)
+    p.add_argument("--expect-control-fp", default=None,
+                   help="pin the control pubkey: full base64url pubkey or its "
+                        "short fingerprint. The fingerprint MUST arrive via a "
+                        "second channel (in-band with the link it adds "
+                        "nothing); see check_control_fp.")
     p = sub.add_parser("join-link"); p.add_argument("link"); p.add_argument("--name", required=True)
+    p.add_argument("--expect-control-fp", default=None,
+                   help="pin the control pubkey: full base64url pubkey or its "
+                        "short fingerprint. The fingerprint MUST arrive via a "
+                        "second channel (in-band with the link it adds "
+                        "nothing); see check_control_fp.")
     p = sub.add_parser("send"); p.add_argument("space_id"); p.add_argument("body")
     p = sub.add_parser("fetch"); p.add_argument("space_id"); p.add_argument("--since", default="")
     p = sub.add_parser("members"); p.add_argument("space_id")
     p = sub.add_parser("kick"); p.add_argument("space_id"); p.add_argument("pubkey")
     p = sub.add_parser("republish"); p.add_argument("space_id")
     p = sub.add_parser("rotate"); p.add_argument("space_id")
+    p = sub.add_parser("rotate-key"); p.add_argument("space_id")
+    p = sub.add_parser("rotate-epoch"); p.add_argument("space_id")
     p = sub.add_parser("delete"); p.add_argument("space_id")
 
     a = ap.parse_args(argv)
@@ -1032,10 +1574,10 @@ def main(argv=None) -> int:
             print(f"link:   {s['link']}")
             print(f"code:   {s['code']}")
         elif a.cmd == "join-code":
-            s = r.join_code(a.code, a.name)
+            s = r.join_code(a.code, a.name, a.expect_control_fp)
             print(f"joined: {s['space_id']}")
         elif a.cmd == "join-link":
-            s = r.join_link(a.link, a.name)
+            s = r.join_link(a.link, a.name, a.expect_control_fp)
             print(f"joined: {s['space_id']}")
         elif a.cmd == "send":
             m = r.send(a.space_id, a.body)
@@ -1046,9 +1588,12 @@ def main(argv=None) -> int:
                 # A message is shown only when its signature verifies AND it
                 # decrypts. Anything else is reported as an arrival, never
                 # as content — a failed signature means the bytes are not
-                # trustworthy, whatever they decrypt to.
+                # trustworthy, whatever they decrypt to. The fingerprint
+                # after the name tells duplicate display names apart.
                 if m["sig_ok"] and m["decrypt_ok"]:
-                    print(f"[✓] {m['author_display']}: {m['body']}")
+                    vtag = " v1" if m.get("version", 1) == 1 else ""
+                    print(f"[✓{vtag}] {m['author_display']} · "
+                          f"{short_fp(m['pubkey'])}: {m['body']}")
                 elif m.get("note"):
                     print(f"[!] {m['note']} (content withheld)")
                 elif not m["sig_ok"]:
@@ -1063,8 +1608,13 @@ def main(argv=None) -> int:
             resp = r.members(a.space_id)
             for m in resp["members"]:
                 flag = {True: "✓", False: "!", None: "?"}[m["cert_ok"]]
-                print(f"[{flag}] {m['display_name']}")
+                vtag = " [v1]" if not m.get("x_pubkey") else ""
+                print(f"[{flag}] {m['display_name']} · "
+                      f"{short_fp(m['pubkey'])}{vtag}")
             print(f"epoch: {resp['epoch']}")
+            for n in resp.get("notices", []):
+                print(f"roster {n['level']}: {n['detail']}",
+                      file=sys.stderr)
         elif a.cmd == "kick":
             res = r.kick(a.space_id, a.pubkey)
             print(f"kicked {res['kicked']} — space is now at epoch "
@@ -1089,6 +1639,25 @@ def main(argv=None) -> int:
                 print(f"rotated to epoch {res['epoch']}")
             else:
                 print(f"already at epoch {res['epoch']} — nothing to do")
+        elif a.cmd == "rotate-key":
+            res = r.rotate_key(a.space_id)
+            print(f"new link: {res['link']}")
+            print("forward-only: the old link can no longer join, but "
+                  "existing members are NOT evicted (use kick for that), "
+                  "and old v1 messages stay readable with the retained "
+                  "keys.")
+            if res["epoch"] == 0:
+                print("WARNING: this space is still at epoch 0 (v1). "
+                      "Link rotation fragments v1 messaging until the "
+                      "space moves to v2 (epoch rotation via a kick "
+                      "cycle): members holding only the old key cannot "
+                      "read new v1 messages, and vice versa.")
+        elif a.cmd == "rotate-epoch":
+            res = r.rotate_epoch(a.space_id)
+            print(f"rotated epoch to {res['epoch']} (no members removed)")
+            if res["left_behind"]:
+                print("left on v1 (no X25519 key — rejoin to rotate): "
+                      + ", ".join(res["left_behind"]))
         elif a.cmd == "delete":
             r.delete(a.space_id)
             print("deleted")

@@ -3,7 +3,7 @@
 import {
   parseRelayLink, joinWithKey, codeLookup, registerWithSeed,
   sendMessage, fetchMessages, deleteSpace,
-  verifyRoster, resolveAuthor, agentSetupPrompt, copyText,
+  verifyRoster, resolveAuthor, shortFp, agentSetupPrompt, copyText,
 } from "./relay.js";
 import { QRCode } from "./qr.js";
 
@@ -99,6 +99,8 @@ function renderMembers() {
     [m.pubkey, { name: m.display_name, certOk: m.certOk }]));
   $("members").innerHTML = S.members.map((m) =>
     `<span class="member"><span class="dot"></span>${esc(m.display_name)}` +
+    ` <span class="fp">· ${esc(shortFp(m.pubkey))}</span>` +
+    (!m.x_pubkey ? ` <span class="badge">v1</span>` : ``) +
     (m.certOk === false ? ` <span class="badge warn">unverified</span>` : ``) +
     `</span>`).join("");
   return names;
@@ -109,12 +111,14 @@ function renderMessage(m, names, mine) {
   // is never shown when a verified roster entry exists for the signing
   // key. Own messages show our own display name. Fallbacks are clearly
   // marked — see resolveAuthor (same rule as relay.py resolve_author).
+  // The fingerprint after the name tells duplicate display names apart.
   let who;
   if (mine) {
-    who = S.displayName;
+    who = `${S.displayName} · ${shortFp(S.member.pubB64)}`;
   } else {
     who = resolveAuthor(m.pubkey, names,
-      m.plaintext ? m.plaintext.author : null).display;
+      m.plaintext ? m.plaintext.author : null).display +
+      ` · ${shortFp(m.pubkey)}`;
   }
   let body;
   if (m.plaintext) body = esc(m.plaintext.body);
@@ -123,9 +127,10 @@ function renderMessage(m, names, mine) {
   const badge = m.sigOk
     ? `<span class="badge ok">verified</span>`
     : `<span class="badge warn">unverified</span>`;
+  const vtag = m.version === 1 ? `<span class="badge">v1</span>` : ``;
   const el = document.createElement("div");
   el.className = "msg" + (mine ? " mine" : "");
-  el.innerHTML = `<div class="meta"><span class="who">${esc(who)}</span>${badge}<span class="when">${timeAgo(m.ts)}</span></div><div class="body">${body}</div>`;
+  el.innerHTML = `<div class="meta"><span class="who">${esc(who)}</span>${badge}${vtag}<span class="when">${timeAgo(m.ts)}</span></div><div class="body">${body}</div>`;
   return el;
 }
 

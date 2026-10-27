@@ -28,6 +28,7 @@ const SIG_DOMAIN = "muse-relay-msg-v1";
 const SIG2_DOMAIN = "muse-relay-msg-v2";
 const KICK_DOMAIN = "muse-relay-kick-v1";
 const EPOCH_DOMAIN = "muse-relay-epoch-v1";
+const ROTATEKEY_DOMAIN = "muse-relay-rotatekey-v1";
 const CERT_DOMAIN = "muse-relay-member-v1";
 const MAX_MEMBERS = 50;
 const MAX_CIPHERTEXT_B64 = 44000; // ~32KB plaintext
@@ -109,6 +110,19 @@ function epochInput(spaceIdB64, epoch) {
     new TextEncoder().encode(EPOCH_DOMAIN),
     b64urlToBytes(spaceIdB64),
     epochBytes(epoch)
+  );
+}
+
+/* Link-key rotation: domain || space || new wrapped_control || new
+ * wrapped (code-path blob). Both blobs are bound, so a request cannot
+ * be repurposed to rotate one blob but not the other. Must match
+ * relay.py _rotatekey_input exactly. */
+function rotateKeyInput(spaceIdB64, wrappedControlB64, wrappedB64) {
+  return concat(
+    new TextEncoder().encode(ROTATEKEY_DOMAIN),
+    b64urlToBytes(spaceIdB64),
+    b64urlToBytes(wrappedControlB64),
+    b64urlToBytes(wrappedB64)
   );
 }
 
@@ -270,10 +284,12 @@ async function handleCreate(env, req, ip) {
   if (!validName(display_name)) return json({ error: "bad display_name" }, 400);
   if (!validPubkey(pubkey)) return json({ error: "bad pubkey" }, 400);
   if (!validCert(cert)) return json({ error: "bad cert" }, 400);
-  // x_pubkey is optional: pre-rotation clients omit it. A member without
-  // one simply cannot receive epoch keys (see handleEpochKeys).
-  if (x_pubkey !== undefined && x_pubkey !== null && !validXPubkey(x_pubkey))
-    return json({ error: "bad x_pubkey" }, 400);
+  // v1 retirement: every member must carry an X25519 key, so epoch
+  // rotation can reach them. Pre-rotation clients (which omit x_pubkey)
+  // can no longer join; existing v1 members and v1 messages still work,
+  // but no NEW member may join without rotation capability.
+  if (!validXPubkey(x_pubkey))
+    return json({ error: "x_pubkey required (v1 retired)" }, 400);
   if (!verifyMemberCert(control_pub, space_id, pubkey, display_name, cert))
     return json({ error: "bad member cert" }, 403);
   if (await getSpace(env, space_id)) return json({ error: "space exists" }, 409);
@@ -350,11 +366,19 @@ async function handleAddMember(env, req, ip, spaceId) {
   if (!validPubkey(pubkey)) return json({ error: "bad pubkey" }, 400);
   if (space.members.some((m) => m.pubkey === pubkey))
     return json({ ok: true, members: space.members });
+  // Duplicate display names are rejected. This is ADVISORY, not a
+  // security boundary: the check-then-write races under KV eventual
+  // consistency, so two simultaneous joins with the same name can both
+  // land. The real defense is the fingerprint display (name · short
+  // pubkey fingerprint), which tells duplicates apart even when they do.
+  if (space.members.some((m) => m.display_name === display_name.trim()))
+    return json({ error: "display_name taken" }, 409);
   // Membership requires a certificate minted under the space control key.
   // Only key holders can produce one; the server cannot forge members.
   if (!validCert(cert)) return json({ error: "bad cert" }, 400);
-  if (x_pubkey !== undefined && x_pubkey !== null && !validXPubkey(x_pubkey))
-    return json({ error: "bad x_pubkey" }, 400);
+  // v1 retirement: see handleCreate — no new member without x_pubkey.
+  if (!validXPubkey(x_pubkey))
+    return json({ error: "x_pubkey required (v1 retired)" }, 400);
   if (!verifyMemberCert(space.control_pub, spaceId, pubkey, display_name, cert))
     return json({ error: "bad member cert" }, 403);
   if (space.members.length >= MAX_MEMBERS)
@@ -627,6 +651,90 @@ async function handleEpochKeysGet(env, spaceId) {
   return json(space.epoch_keys);
 }
 
+/* Kickless epoch advance: rotate the epoch key WITHOUT removing
+ * anyone. This is the primitive weekly rotation and join-triggered
+ * rotation use. The rules mirror kick's bundle rules minus the
+ * removal: the epoch must advance by exactly 1 (blocks replays), every
+ * wrapped key must belong to a CURRENT roster member, and the bundle
+ * statement must carry a control-key signature. Members re-run
+ * `rotate` to fetch the new key, exactly as after a kick. Like kick,
+ * this only excludes anyone from FUTURE v2 epochs — it never
+ * retroactively protects anything. */
+async function handleRotateEpoch(env, req, ip, spaceId) {
+  if (await rateLimited(env, ip, "rotateepoch", 20))
+    return json({ error: "rate limited, try again shortly" }, 429);
+  const space = await getSpace(env, spaceId);
+  if (!space) return json({ error: "unknown space" }, 404);
+  let b;
+  try {
+    b = await readJson(req);
+  } catch {
+    return json({ error: "invalid JSON" }, 400);
+  }
+  const { epoch, admin_x_pub, keys, signature } = b;
+  if (!validEpoch(epoch)) return json({ error: "bad epoch" }, 400);
+  if (!validXPubkey(admin_x_pub))
+    return json({ error: "bad admin_x_pub" }, 400);
+  if (!validSig(signature)) return json({ error: "bad signature" }, 400);
+  if (!Array.isArray(keys) || keys.length > MAX_MEMBERS)
+    return json({ error: "bad keys" }, 400);
+  for (const k of keys) {
+    if (!k || !validPubkey(k.pubkey) || typeof k.wrapped !== "string" ||
+        k.wrapped.length > MAX_WRAPPED_B64 || !RE_B64URL.test(k.wrapped))
+      return json({ error: "bad wrapped key" }, 400);
+    if (!space.members.some((m) => m.pubkey === k.pubkey))
+      return json({ error: "wrapped key for non-member" }, 400);
+  }
+  if (epoch !== (space.epoch || 0) + 1)
+    return json({ error: "stale epoch" }, 400);
+  if (!verifyControlSig(space.control_pub,
+      epochInput(spaceId, epoch), signature))
+    return json({ error: "bad epoch signature" }, 403);
+  space.epoch = epoch;
+  space.epoch_keys = { epoch, admin_x_pub, keys };
+  await putSpace(env, spaceId, space);
+  return json({ ok: true, epoch });
+}
+
+/* Link-key rotation: replace the space key (both wrapped blobs, so the
+ * link path and the code path rotate together). Authorized by a
+ * control-key signature over both new blobs — any control-seed holder
+ * can rotate, which is consistent with the honest model: seed holders
+ * hold admin rights, and admission control is link secrecy.
+ *
+ * Rotation is FORWARD-ONLY, exactly like kick: it blocks FUTURE joins
+ * with the old link, but it does not evict existing members (that is
+ * kick) and it does not protect already-distributed v1 history — old
+ * space keys still decrypt old v1 messages, which is why clients retain
+ * a key history. Epoch and members are untouched. */
+async function handleRotateKey(env, req, ip, spaceId) {
+  if (await rateLimited(env, ip, "rotatekey", 20))
+    return json({ error: "rate limited, try again shortly" }, 429);
+  const space = await getSpace(env, spaceId);
+  if (!space) return json({ error: "unknown space" }, 404);
+  let b;
+  try {
+    b = await readJson(req);
+  } catch {
+    return json({ error: "invalid JSON" }, 400);
+  }
+  const { wrapped_control, wrapped, signature } = b;
+  if (typeof wrapped_control !== "string" || wrapped_control.length > 300 ||
+      !RE_B64URL.test(wrapped_control))
+    return json({ error: "bad wrapped control" }, 400);
+  if (typeof wrapped !== "string" || wrapped.length > 200 ||
+      !RE_B64URL.test(wrapped))
+    return json({ error: "bad wrapped key" }, 400);
+  if (!validSig(signature)) return json({ error: "bad signature" }, 400);
+  if (!verifyControlSig(space.control_pub,
+      rotateKeyInput(spaceId, wrapped_control, wrapped), signature))
+    return json({ error: "bad rotate-key signature" }, 403);
+  space.wrapped_control = wrapped_control;
+  space.wrapped = wrapped;
+  await putSpace(env, spaceId, space);
+  return json({ ok: true });
+}
+
 async function handleDelete(env, req, spaceId) {
   const space = await getSpace(env, spaceId);
   if (!space) return json({ error: "unknown space" }, 404);
@@ -685,7 +793,7 @@ export default {
       if (path === "/api/spaces/join" && req.method === "POST")
         return await handleJoin(env, req, ip);
 
-      const m = path.match(/^\/api\/spaces\/([A-Za-z0-9_-]{22})\/(members|messages|control|kick|epoch-keys)$/);
+      const m = path.match(/^\/api\/spaces\/([A-Za-z0-9_-]{22})\/(members|messages|control|kick|epoch-keys|rotate-key|rotate-epoch)$/);
       if (m) {
         const [, spaceId, what] = m;
         if (what === "members" && req.method === "POST")
@@ -704,6 +812,10 @@ export default {
           return await handleEpochKeysPost(env, req, ip, spaceId);
         if (what === "epoch-keys" && req.method === "GET")
           return await handleEpochKeysGet(env, spaceId);
+        if (what === "rotate-key" && req.method === "POST")
+          return await handleRotateKey(env, req, ip, spaceId);
+        if (what === "rotate-epoch" && req.method === "POST")
+          return await handleRotateEpoch(env, req, ip, spaceId);
       }
       const d = path.match(/^\/api\/spaces\/([A-Za-z0-9_-]{22})$/);
       if (d && req.method === "DELETE") return await handleDelete(env, req, d[1]);
